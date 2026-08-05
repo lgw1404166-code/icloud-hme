@@ -17,7 +17,9 @@ package main
 import (
 	"flag"
 	"log"
+	"os"
 	"path/filepath"
+	"strings"
 
 	"icloud-hme/internal/account"
 	"icloud-hme/internal/server"
@@ -43,7 +45,11 @@ func main() {
 	count := len(mgr.ListAccounts())
 	log.Printf("账号加载完成 count=%d data_dir=%s", count, abs)
 
-	srv := server.New(mgr, *debug)
+	apiKey := strings.TrimSpace(os.Getenv("ICLOUD_HME_API_KEY"))
+	if apiKey == "" {
+		log.Printf("警告: ICLOUD_HME_API_KEY 未配置，API Key 鉴权不可用")
+	}
+	srv := server.New(mgr, *debug, apiKey)
 
 	log.Printf("HTTP 服务就绪 addr=%s", *addr)
 	if err := srv.Run(*addr); err != nil {

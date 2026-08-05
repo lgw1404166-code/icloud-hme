@@ -20,28 +20,29 @@ import (
 
 // Account 描述一个 iCloud 账号。
 type Account struct {
-	ID           string            `json:"id"`
-	Name         string            `json:"name"`
-	RealEmail    string            `json:"real_email"`
-	ICloudEmail  string            `json:"icloud_email"`
-	Cookies      map[string]string `json:"cookies"`
-	Host         string            `json:"host"`
-	Proxy        string            `json:"proxy,omitempty"` // HTTP/SOCKS5 代理
-	AppPassword  string            `json:"app_password,omitempty"`
-	Status       string            `json:"status"` // active / error
-	AliasTotal   int               `json:"alias_total"`
-	AliasActive  int               `json:"alias_active"`
-	LastValidated string           `json:"last_validated"`
-	LastError    string            `json:"last_error,omitempty"`
-	CreatedAt    string            `json:"created_at"`
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	RealEmail     string            `json:"real_email"`
+	ICloudEmail   string            `json:"icloud_email"`
+	Cookies       map[string]string `json:"cookies"`
+	Host          string            `json:"host"`
+	Proxy         string            `json:"proxy,omitempty"` // HTTP/SOCKS5 代理
+	AppPassword   string            `json:"app_password,omitempty"`
+	HMEClientID   string            `json:"hme_client_id,omitempty"`
+	Status        string            `json:"status"` // active / error
+	AliasTotal    int               `json:"alias_total"`
+	AliasActive   int               `json:"alias_active"`
+	LastValidated string            `json:"last_validated"`
+	LastError     string            `json:"last_error,omitempty"`
+	CreatedAt     string            `json:"created_at"`
 }
 
 // Manager 管理多个 iCloud 账号,线程安全。
 type Manager struct {
-	mu        sync.Mutex
-	accounts  map[string]*Account
-	dataDir   string
-	dataFile  string
+	mu       sync.Mutex
+	accounts map[string]*Account
+	dataDir  string
+	dataFile string
 }
 
 // NewManager 创建管理器。dataDir 用于存放 accounts.json。
@@ -85,12 +86,21 @@ func (m *Manager) load() error {
 	if m.accounts == nil {
 		m.accounts = make(map[string]*Account)
 	}
+	migrated := false
+	for _, acc := range m.accounts {
+		if ensureHMEClientID(acc) {
+			migrated = true
+		}
+	}
+	if migrated {
+		return m.save()
+	}
 	return nil
 }
 
 func (m *Manager) save() error {
 	wrapper := struct {
-		Accounts map[string]*Account `json:"accounts"`
+		Accounts  map[string]*Account `json:"accounts"`
 		UpdatedAt string              `json:"updated_at"`
 	}{
 		Accounts:  m.accounts,
@@ -103,9 +113,10 @@ func (m *Manager) save() error {
 	return os.WriteFile(m.dataFile, raw, 0600)
 }
 
-// ParseCookieInput 解析 Cookie 输入,支持两种格式:
+// ParseCookieInput 解析 Cookie 输入,支持三种格式:
 //   - Header String: "name1=value1; name2=value2; ..."
 //   - JSON: {"name1":"value1","name2":"value2"}
+//   - 浏览器导出数组: [{"name":"name1","value":"value1"}]
 //
 // 空输入返回错误。
 func ParseCookieInput(raw string) (map[string]string, error) {
@@ -126,6 +137,23 @@ func ParseCookieInput(raw string) (map[string]string, error) {
 			}
 			if len(out) > 0 {
 				return out, nil
+			}
+		}
+	}
+	if strings.HasPrefix(raw, "[") {
+		var items []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		}
+		if err := json.Unmarshal([]byte(raw), &items); err == nil {
+			cookies := make(map[string]string, len(items))
+			for _, item := range items {
+				if strings.TrimSpace(item.Name) != "" {
+					cookies[item.Name] = item.Value
+				}
+			}
+			if len(cookies) > 0 {
+				return cookies, nil
 			}
 		}
 	}
@@ -150,38 +178,38 @@ func ParseCookieInput(raw string) (map[string]string, error) {
 	return cookies, nil
 }
 
-// AddAccount 添加一个账号。cookieInput 可为空,后续可通过 /login 获取。
+// AddAccount 添加一个账号。cookieInput 必须包含浏览器导出的 Cookie。
 //
 // cookieInput 支持 Header String 或 JSON。校验失败仍会保存账号(status=error),
 // 方便用户后续修正 Cookie 后重新校验。
 func (m *Manager) AddAccount(name, cookieInput, host, proxy string) (*Account, error) {
+	if strings.TrimSpace(cookieInput) == "" {
+		return nil, fmt.Errorf("cookies 必填,请粘贴浏览器导出的 Cookie")
+	}
 	var cookies map[string]string
-	if cookieInput != "" {
-		var err error
-		cookies, err = ParseCookieInput(cookieInput)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		cookies = make(map[string]string)
+	var err error
+	cookies, err = ParseCookieInput(cookieInput)
+	if err != nil {
+		return nil, err
 	}
 	if host == "" {
 		host = "icloud.com"
 	}
 
 	acc := &Account{
-		ID:        "acc_" + uuid.New().String()[:8],
-		Name:      name,
-		Cookies:   cookies,
-		Host:      host,
-		Proxy:     proxy,
-		Status:    "pending", // 无 Cookie 时为 pending
-		CreatedAt: time.Now().Format(time.RFC3339),
+		ID:          "acc_" + uuid.New().String()[:8],
+		Name:        name,
+		Cookies:     cookies,
+		Host:        host,
+		Proxy:       proxy,
+		HMEClientID: uuid.New().String(),
+		Status:      "pending",
+		CreatedAt:   time.Now().Format(time.RFC3339),
 	}
 
 	// 有 Cookie 才校验会话
 	if len(cookies) > 0 {
-		client, err := hme.NewClient(cookies, host, proxy, false)
+		client, err := hme.NewClientWithID(cookies, host, proxy, acc.HMEClientID, false)
 		if err != nil {
 			return nil, err
 		}
@@ -237,6 +265,7 @@ func (m *Manager) GetAccount(id string) (*Account, bool) {
 		return nil, false
 	}
 	cp := *acc
+	cp.Cookies = cloneStringMap(acc.Cookies)
 	return &cp, true
 }
 
@@ -248,6 +277,8 @@ func (m *Manager) ListAccounts() []*Account {
 	for _, acc := range m.accounts {
 		cp := *acc
 		cp.Cookies = nil
+		cp.AppPassword = ""
+		cp.HMEClientID = ""
 		out = append(out, &cp)
 	}
 	return out
@@ -258,50 +289,22 @@ func (m *Manager) ListAccounts() []*Account {
 func (m *Manager) HMEClient(id string, verbose bool) (*hme.Client, error) {
 	m.mu.Lock()
 	acc, ok := m.accounts[id]
+	var cookies map[string]string
+	var host, proxy, clientID string
+	if ok {
+		cookies = cloneStringMap(acc.Cookies)
+		host = acc.Host
+		proxy = acc.Proxy
+		clientID = acc.HMEClientID
+	}
 	m.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
-	if len(acc.Cookies) == 0 {
+	if len(cookies) == 0 {
 		return nil, fmt.Errorf("账号未配置 Cookie，无法使用 HME 功能")
 	}
-	return hme.NewClient(acc.Cookies, acc.Host, acc.Proxy, verbose)
-}
-
-// HMEClientWithPassword 为指定账号创建一个新的 HME 客户端,使用账号密码登录。
-// 登录成功后会自动获取 Cookie 并保存到账号配置。
-func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTPProvider) (*hme.Client, error) {
-	m.mu.Lock()
-	acc, ok := m.accounts[id]
-	m.mu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("账号不存在: %s", id)
-	}
-
-	email := acc.ICloudEmail
-	if email == "" {
-		email = acc.RealEmail
-	}
-	if email == "" {
-		return nil, fmt.Errorf("账号未设置邮箱地址")
-	}
-
-	client, err := hme.NewClient(nil, acc.Host, acc.Proxy, true)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := client.Login(email, password, otpProvider); err != nil {
-		return nil, err
-	}
-
-	// 保存登录后的 Cookie 到账号
-	m.mu.Lock()
-	acc.Cookies = client.Cookies
-	m.save()
-	m.mu.Unlock()
-
-	return client, nil
+	return hme.NewClientWithID(cookies, host, proxy, clientID, verbose)
 }
 
 // MailClient 为指定账号创建 IMAP 邮件客户端。
@@ -309,21 +312,26 @@ func (m *Manager) HMEClientWithPassword(id, password string, otpProvider hme.OTP
 func (m *Manager) MailClient(id string) (*mail.Client, error) {
 	m.mu.Lock()
 	acc, ok := m.accounts[id]
+	var imapEmail, realEmail, appPassword string
+	if ok {
+		imapEmail = acc.ICloudEmail
+		realEmail = acc.RealEmail
+		appPassword = acc.AppPassword
+	}
 	m.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
-	imapEmail := acc.ICloudEmail
 	if imapEmail == "" {
-		imapEmail = acc.RealEmail
+		imapEmail = realEmail
 	}
 	if !isICloudDomain(imapEmail) {
 		return nil, fmt.Errorf("账号未设置 iCloud 邮箱 (当前: %s)", imapEmail)
 	}
-	if acc.AppPassword == "" {
+	if appPassword == "" {
 		return nil, fmt.Errorf("账号未设置 App 专用密码")
 	}
-	return mail.NewClient(imapEmail, acc.AppPassword), nil
+	return mail.NewClient(imapEmail, appPassword), nil
 }
 
 // WebMailClient 为指定账号创建 Web 邮件客户端。
@@ -331,23 +339,29 @@ func (m *Manager) MailClient(id string) (*mail.Client, error) {
 func (m *Manager) WebMailClient(id string) (*mail.WebClient, error) {
 	m.mu.Lock()
 	acc, ok := m.accounts[id]
+	var cookies map[string]string
+	var host string
+	if ok {
+		cookies = cloneStringMap(acc.Cookies)
+		host = acc.Host
+	}
 	m.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
-	if len(acc.Cookies) == 0 {
+	if len(cookies) == 0 {
 		return nil, fmt.Errorf("账号未配置 Cookie，无法读取邮件")
 	}
 	// 从 cookies 中获取 dsid
 	dsid := ""
-	if v, ok := acc.Cookies["X-APPLE-WEBAUTH-USER"]; ok {
+	if v, ok := cookies["X-APPLE-WEBAUTH-USER"]; ok {
 		// 解析 "v=1:s=1:d=22789132008" 格式
 		parts := strings.Split(v, ":d=")
 		if len(parts) == 2 {
 			dsid = parts[1]
 		}
 	}
-	return mail.NewWebClient(acc.Cookies, dsid, acc.Host), nil
+	return mail.NewWebClient(cookies, dsid, host), nil
 }
 
 // SetAppPassword 设置 iCloud 邮箱和 App 专用密码,并测试 IMAP 连接。
@@ -397,7 +411,29 @@ func (m *Manager) SaveCookies(id string, cookies map[string]string) error {
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
-	acc.Cookies = cookies
+	acc.Cookies = cloneStringMap(cookies)
+	return m.save()
+}
+
+// SaveAliasStats 保存指定账号的 Cookie 和最新别名统计。
+// 别名列表是 iCloud 的事实来源，账号列表中的汇总字段由此同步。
+func (m *Manager) SaveAliasStats(id string, aliases []hme.Alias, cookies map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	if cookies != nil {
+		acc.Cookies = cloneStringMap(cookies)
+	}
+	acc.AliasTotal = len(aliases)
+	acc.AliasActive = 0
+	for _, alias := range aliases {
+		if alias.Active {
+			acc.AliasActive++
+		}
+	}
 	return m.save()
 }
 
@@ -408,19 +444,30 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 	}
 	m.mu.Lock()
 	acc, ok := m.accounts[id]
+	var host, proxy, clientID string
+	if ok {
+		host = acc.Host
+		proxy = acc.Proxy
+		clientID = acc.HMEClientID
+	}
 	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
 
 	// 自动校验 Cookie 是否有效
-	acc.Cookies = cookies
-	if acc.Host == "" {
-		acc.Host = "icloud.com"
+	if host == "" {
+		host = "icloud.com"
 	}
-	client, err := hme.NewClient(cookies, acc.Host, acc.Proxy, false)
+	client, err := hme.NewClientWithID(cookies, host, proxy, clientID, false)
 	if err != nil {
 		m.mu.Lock()
+		acc, ok = m.accounts[id]
+		if !ok {
+			m.mu.Unlock()
+			return fmt.Errorf("账号不存在: %s", id)
+		}
+		acc.Cookies = cloneStringMap(cookies)
 		acc.Status = "error"
 		acc.LastError = "创建客户端失败: " + err.Error()
 		m.accounts[id] = acc
@@ -428,22 +475,54 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 		m.mu.Unlock()
 		return err
 	}
+
+	status := "active"
+	lastError := ""
+	lastValidated := time.Now().Format(time.RFC3339)
+	var realEmail, icloudEmail string
+	var aliases []hme.Alias
+	aliasesLoaded := false
 	if err := client.ValidateSession(); err != nil {
-		acc.Status = "error"
-		acc.LastError = "Cookie 校验失败: " + err.Error()
+		status = "error"
+		lastError = "Cookie 校验失败: " + err.Error()
 	} else {
-		acc.Status = "active"
-		acc.LastValidated = time.Now().Format(time.RFC3339)
-		acc.LastError = ""
 		if info := client.AccountInfo(); info != nil {
-			acc.RealEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail)
-			if acc.ICloudEmail == "" {
-				acc.ICloudEmail = deriveICloudEmail(info)
-			}
+			realEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail)
+			icloudEmail = deriveICloudEmail(info)
+		}
+		if listed, listErr := client.ListAliases(); listErr == nil {
+			aliases = listed
+			aliasesLoaded = true
 		}
 	}
 
 	m.mu.Lock()
+	acc, ok = m.accounts[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	acc.Cookies = cloneStringMap(client.Cookies)
+	acc.Status = status
+	acc.LastError = lastError
+	if status == "active" {
+		acc.LastValidated = lastValidated
+		if realEmail != "" {
+			acc.RealEmail = realEmail
+		}
+		if acc.ICloudEmail == "" && icloudEmail != "" {
+			acc.ICloudEmail = icloudEmail
+		}
+	}
+	if aliasesLoaded {
+		acc.AliasTotal = len(aliases)
+		acc.AliasActive = 0
+		for _, alias := range aliases {
+			if alias.Active {
+				acc.AliasActive++
+			}
+		}
+	}
 	m.accounts[id] = acc
 	saveErr := m.save()
 	m.mu.Unlock()
@@ -495,4 +574,26 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+func ensureHMEClientID(acc *Account) bool {
+	if acc == nil {
+		return false
+	}
+	if _, err := uuid.Parse(acc.HMEClientID); err == nil {
+		return false
+	}
+	acc.HMEClientID = uuid.New().String()
+	return true
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }

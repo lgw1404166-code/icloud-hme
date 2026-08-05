@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	stdhttp "net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,6 +61,21 @@ type Alias struct {
 	CreatedAt   string `json:"createdAt,omitempty"`
 }
 
+// HTTPError 描述 iCloud 返回的非 2xx 响应。
+// Body 只保留经过清理和截断的响应摘要，不包含请求 Cookie。
+type HTTPError struct {
+	StatusCode int
+	Body       string
+	RetryAfter time.Duration
+}
+
+func (e *HTTPError) Error() string {
+	if e.Body == "" {
+		return fmt.Sprintf("HTTP %d", e.StatusCode)
+	}
+	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Body)
+}
+
 // Client 是 iCloud Hide My Email 客户端。
 //
 // 一个 Client 对应一个 iCloud 账号。通过传入的 Cookie 维持会话,
@@ -67,14 +84,12 @@ type Client struct {
 	Cookies     map[string]string
 	Host        string // "icloud.com" 或 "icloud.com.cn"
 	Proxy       string // HTTP/SOCKS5 代理
-	Username    string // iCloud 账号 (用于登录)
-	Password    string // iCloud 密码 (用于登录)
 	Verbose     bool
 	httpc       tls_client.HttpClient
 	setupURL    string
 	serviceURL  string
 	dsid        string // 从 validate 响应提取
-	clientID    string // UUID,每次会话生成
+	clientID    string // 稳定 UUID，由账号管理器持久化
 	accountInfo *AccountInfo
 }
 
@@ -84,9 +99,19 @@ type Client struct {
 //   - HTTP:  "http://user:pass@host:port"
 //   - SOCKS5: "socks5://user:pass@host:port"
 func NewClient(cookies map[string]string, host, proxy string, verbose bool) (*Client, error) {
+	return NewClientWithID(cookies, host, proxy, "", verbose)
+}
+
+// NewClientWithID 使用稳定的 clientID 创建 HME 客户端。
+// clientID 为空或不是 UUID 时会生成新值；账号管理器应持久化该值并重复使用。
+func NewClientWithID(cookies map[string]string, host, proxy, clientID string, verbose bool) (*Client, error) {
 	if host == "" {
 		host = "icloud.com"
 	}
+	if _, err := uuid.Parse(clientID); err != nil {
+		clientID = uuid.New().String()
+	}
+	cookies = cloneCookies(cookies)
 	jar := tls_client.NewCookieJar()
 	options := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(30),
@@ -111,7 +136,7 @@ func NewClient(cookies map[string]string, host, proxy string, verbose bool) (*Cl
 		Proxy:    proxy,
 		Verbose:  verbose,
 		httpc:    httpc,
-		clientID: uuid.New().String(),
+		clientID: clientID,
 	}
 
 	// 把传入的 Cookie 灌入 jar,后续请求自动携带。
@@ -146,6 +171,20 @@ func NewClient(cookies map[string]string, host, proxy string, verbose bool) (*Cl
 		}
 	}
 	return c, nil
+}
+
+// ClientID 返回当前客户端使用的稳定 UUID。
+func (c *Client) ClientID() string { return c.clientID }
+
+func cloneCookies(cookies map[string]string) map[string]string {
+	if cookies == nil {
+		return make(map[string]string)
+	}
+	cloned := make(map[string]string, len(cookies))
+	for name, value := range cookies {
+		cloned[name] = value
+	}
+	return cloned
 }
 
 func normalizeHost(host string) string {
@@ -258,10 +297,10 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 		req.Header.Set("Sec-Fetch-Dest", "empty")
 		req.Header.Set("Sec-Fetch-Mode", "cors")
 		req.Header.Set("Sec-Fetch-Site", "same-site")
-		req.Header.Set("sec-ch-ua", `"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"`)
+		req.Header.Set("sec-ch-ua", `"Google Chrome";v="146", "Not.A/Brand";v="8", "Chromium";v="146"`)
 		req.Header.Set("sec-ch-ua-mobile", "?0")
 		req.Header.Set("sec-ch-ua-platform", `"Windows"`)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
 
 		// 手动添加 Cookie 头（确保跨域也能传递）
 		// 浏览器发送的 Cookie 值带双引号,iCloud 严格匹配
@@ -276,16 +315,8 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 			}
 			cookieHeader := strings.Join(cookieParts, "; ")
 			req.Header.Set("Cookie", cookieHeader)
-			if c.Verbose {
-				c.log(">>> URL: %s", fullURL)
-				c.log(">>> Cookie: %s", cookieHeader[:min(200, len(cookieHeader))])
-				for k, vv := range req.Header {
-					for _, v := range vv {
-						c.log(">>> %s: %s", k, v[:min(100, len(v))])
-					}
-				}
-			}
 		}
+		c.log(">>> %s %s", method, fullURL)
 
 		resp, err := c.httpc.Do(req)
 		if err != nil {
@@ -308,13 +339,15 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			snippet := string(text)
-			if len(snippet) > 200 {
-				snippet = snippet[:200]
+			httpErr := &HTTPError{
+				StatusCode: resp.StatusCode,
+				Body:       sanitizeResponseBody(text),
+				RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
 			}
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet)
-			// 401/403 说明 Cookie 失效,不重试直接返回。
-			if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			lastErr = httpErr
+			c.log("<<< %s", httpErr.Error())
+			// 4xx 是确定性客户端/限流错误，重试只会放大风控。
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 				return "", lastErr
 			}
 			if attempt < maxAttempts {
@@ -330,6 +363,43 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 		return "", lastErr
 	}
 	return "", fmt.Errorf("未知错误")
+}
+
+func sanitizeResponseBody(body []byte) string {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return ""
+	}
+	if json.Valid(trimmed) {
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, trimmed); err == nil {
+			trimmed = compact.Bytes()
+		}
+	}
+	snippet := strings.Join(strings.Fields(string(trimmed)), " ")
+	const maxBodyLength = 1000
+	if len(snippet) > maxBodyLength {
+		snippet = snippet[:maxBodyLength] + "..."
+	}
+	return snippet
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds > 0 {
+			return time.Duration(seconds) * time.Second
+		}
+		return 0
+	}
+	when, err := stdhttp.ParseTime(value)
+	if err != nil || !when.After(now) {
+		return 0
+	}
+	return when.Sub(now)
 }
 
 func (c *Client) sleepRetry(attempt int) {
@@ -446,7 +516,7 @@ func (c *Client) Generate() (string, error) {
 		return "", err
 	}
 	c.log("生成候选别名...")
-	body, err := c.request("POST", c.serviceURL+"/v1/hme/generate", map[string]string{"langCode": "en-us"}, 0, 2)
+	body, err := c.request("POST", c.serviceURL+"/v1/hme/generate", map[string]string{"langCode": "en-us"}, 0, 1)
 	if err != nil {
 		return "", err
 	}
@@ -462,6 +532,9 @@ func (c *Client) Generate() (string, error) {
 		if hme == "" {
 			hme = parsed.Get("result.hme.email").String()
 		}
+	}
+	if hme == "" {
+		return "", fmt.Errorf("生成失败: 响应中缺少邮箱地址")
 	}
 	c.log("候选: %s", hme)
 	return hme, nil
@@ -481,7 +554,7 @@ func (c *Client) Reserve(hme, label string) (string, error) {
 		"label": label,
 		"note":  "Created by icloud_hme tool",
 	}
-	body, err := c.request("POST", c.serviceURL+"/v1/hme/reserve", payload, 0, 2)
+	body, err := c.request("POST", c.serviceURL+"/v1/hme/reserve", payload, 0, 1)
 	if err != nil {
 		return "", err
 	}
@@ -510,13 +583,12 @@ type CreateResult struct {
 
 // CreateAlias 一步完成「生成 + 保留」,创建一个新别名。
 //
-// 由于 generate / reserve 偶发失败,内部会重试 maxRetries 次,
-// 每次重试会重置 serviceURL 强制重新校验会话。
+// maxRetries 仅为兼容已有调用保留；服务端创建接口固定传 1，避免放大 Apple 风控。
 func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error) {
 	if maxRetries <= 0 {
-		maxRetries = 5
+		maxRetries = 1
 	}
-	var lastErr string
+	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
 			c.serviceURL = ""
@@ -525,8 +597,8 @@ func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error
 		}
 		hme, err := c.Generate()
 		if err != nil {
-			lastErr = "generate 失败: " + err.Error()
-			c.log("%s", lastErr)
+			lastErr = fmt.Errorf("generate 失败: %w", err)
+			c.log("%v", lastErr)
 			if attempt < maxRetries-1 {
 				time.Sleep(time.Second)
 				continue
@@ -535,8 +607,8 @@ func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error
 		}
 		email, err := c.Reserve(hme, label)
 		if err != nil {
-			lastErr = err.Error()
-			c.log("reserve 失败: %s", lastErr)
+			lastErr = fmt.Errorf("reserve 失败: %w", err)
+			c.log("%v", lastErr)
 			if attempt < maxRetries-1 {
 				time.Sleep(time.Second)
 				continue
@@ -549,8 +621,8 @@ func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error
 			CreatedAt: time.Now().Format(time.RFC3339),
 		}, nil
 	}
-	if lastErr != "" {
-		return nil, fmt.Errorf("创建别名失败: %s", lastErr)
+	if lastErr != nil {
+		return nil, fmt.Errorf("创建别名失败: %w", lastErr)
 	}
 	return nil, fmt.Errorf("创建别名失败,已重试 %d 次", maxRetries)
 }

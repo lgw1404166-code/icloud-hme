@@ -1,16 +1,22 @@
 // Package server 提供 HTTP API,基于 Gin。
 //
 // 两个核心接口:
-//   POST /api/create  — 在指定账号下创建一个 Hide My Email 别名
-//   GET  /api/inbox   — 读取指定账号(或指定别名)收到的邮件
+//
+//	POST /api/create  — 在指定账号下创建一个 Hide My Email 别名
+//	GET  /api/inbox   — 读取指定账号(或指定别名)收到的邮件
 //
 // 辅助接口(用于多账号管理):账号增删查、别名列表、设置 App 密码。
 package server
 
 import (
+	"crypto/subtle"
+	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"icloud-hme/internal/account"
@@ -18,18 +24,45 @@ import (
 	"icloud-hme/internal/mail"
 )
 
+const (
+	defaultCreateMinInterval     = 30 * time.Second
+	defaultCreateFailureCooldown = 10 * time.Minute
+)
+
+type createAttemptState struct {
+	inFlight    bool
+	nextAllowed time.Time
+}
+
 // Server 封装 Gin 引擎和账号管理器。
 type Server struct {
-	mgr *account.Manager
-	r   *gin.Engine
+	mgr                   *account.Manager
+	r                     *gin.Engine
+	apiKey                string
+	createMu              sync.Mutex
+	createAttempts        map[string]*createAttemptState
+	now                   func() time.Time
+	createMinInterval     time.Duration
+	createFailureCooldown time.Duration
 }
 
 // New 创建 Server。debug 为 true 时启用 Gin 调试日志。
-func New(mgr *account.Manager, debug bool) *Server {
+func New(mgr *account.Manager, debug bool, apiKeys ...string) *Server {
 	if !debug {
 		gin.SetMode(gin.ReleaseMode)
 	}
-	s := &Server{mgr: mgr}
+	apiKey := ""
+	if len(apiKeys) > 0 {
+		apiKey = strings.TrimSpace(apiKeys[0])
+	}
+	s := &Server{
+		mgr:                   mgr,
+		apiKey:                apiKey,
+		createAttempts:        make(map[string]*createAttemptState),
+		now:                   time.Now,
+		createMinInterval:     defaultCreateMinInterval,
+		createFailureCooldown: defaultCreateFailureCooldown,
+	}
 	s.r = gin.Default() // 自带 Logger + Recovery 中间件
 	s.register()
 	return s
@@ -44,6 +77,9 @@ func (s *Server) Run(addr string) error {
 func (s *Server) Handler() http.Handler { return s.r }
 
 func (s *Server) register() {
+	s.r.GET("/_internal/api-key-auth", s.verifyAPIKey)
+	s.registerWeb()
+
 	api := s.r.Group("/api")
 	{
 		// ===== 账号管理 =====
@@ -52,7 +88,6 @@ func (s *Server) register() {
 		api.DELETE("/accounts/:id", s.removeAccount)
 		api.POST("/accounts/:id/password", s.setAppPassword)
 		api.PUT("/accounts/:id/cookies", s.updateCookies)
-		api.POST("/accounts/:id/login", s.loginAccount)
 
 		// ===== 核心接口 1: 创建邮箱 =====
 		api.POST("/create", s.createAlias)
@@ -71,12 +106,28 @@ func (s *Server) register() {
 	}
 }
 
+func (s *Server) verifyAPIKey(c *gin.Context) {
+	provided := c.GetHeader("X-API-Key")
+	if s.apiKey == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(s.apiKey)) != 1 {
+		c.Status(http.StatusUnauthorized)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
 // ---- 统一响应 ----
 
 type apiResp struct {
-	Success bool        `json:"success"`
-	Message string      `json:"message,omitempty"`
-	Data    interface{} `json:"data,omitempty"`
+	Success bool                  `json:"success"`
+	Message string                `json:"message,omitempty"`
+	Data    interface{}           `json:"data,omitempty"`
+	Error   *upstreamErrorDetails `json:"error,omitempty"`
+}
+
+type upstreamErrorDetails struct {
+	UpstreamStatus   int    `json:"upstream_status,omitempty"`
+	UpstreamBody     string `json:"upstream_body,omitempty"`
+	RetryAfterSecond int64  `json:"retry_after_seconds,omitempty"`
 }
 
 func ok(c *gin.Context, data interface{}) {
@@ -87,6 +138,18 @@ func fail(c *gin.Context, code int, msg string) {
 	c.JSON(code, apiResp{Success: false, Message: msg})
 }
 
+func failCreate(c *gin.Context, code int, msg string, httpErr *hme.HTTPError, retryAfter time.Duration) {
+	details := &upstreamErrorDetails{RetryAfterSecond: retryAfterSeconds(retryAfter)}
+	if httpErr != nil {
+		details.UpstreamStatus = httpErr.StatusCode
+		details.UpstreamBody = httpErr.Body
+	}
+	if details.RetryAfterSecond > 0 {
+		c.Header("Retry-After", strconv.FormatInt(details.RetryAfterSecond, 10))
+	}
+	c.JSON(code, apiResp{Success: false, Message: msg, Error: details})
+}
+
 // ====================================================================
 // 核心接口 1: 创建邮箱
 //   POST /api/create
@@ -95,16 +158,22 @@ func fail(c *gin.Context, code int, msg string) {
 // ====================================================================
 
 type createReq struct {
-	AccountID string `json:"account_id" binding:"required"`
+	AccountID string `json:"account_id"`
 	Label     string `json:"label"`
 }
 
 func (s *Server) createAlias(c *gin.Context) {
 	var req createReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, http.StatusBadRequest, "参数错误: account_id 必填 — "+err.Error())
+		fail(c, http.StatusBadRequest, "参数错误: 请求体必须是 JSON — "+err.Error())
 		return
 	}
+	accountID, status, err := s.resolveCreateAccountID(req.AccountID)
+	if err != nil {
+		fail(c, status, err.Error())
+		return
+	}
+	req.AccountID = accountID
 
 	client, err := s.mgr.HMEClient(req.AccountID, false)
 	if err != nil {
@@ -112,19 +181,27 @@ func (s *Server) createAlias(c *gin.Context) {
 		return
 	}
 
-	result, err := client.CreateAlias(req.Label, 5)
+	if retryAfter, allowed := s.beginCreate(req.AccountID); !allowed {
+		failCreate(c, http.StatusTooManyRequests, "该账号的创建请求正在执行或处于冷却期，请稍后重试", nil, retryAfter)
+		return
+	}
+	failureCooldown := time.Duration(0)
+	defer func() { s.finishCreate(req.AccountID, failureCooldown) }()
+
+	result, err := client.CreateAlias(req.Label, 1)
 
 	// 操作完成后,保存可能已刷新的 Cookie（validate 会轮换 token）
 	_ = s.mgr.SaveCookies(req.AccountID, client.Cookies)
 
 	if err != nil {
-		// 区分会话失效(需重新登录)与临时失败
-		msg := err.Error()
-		if isSessionError(msg) {
-			fail(c, http.StatusUnauthorized, "iCloud 会话失效,请更新 Cookie: "+msg)
+		code, message, httpErr, cooldown := s.classifyCreateError(err)
+		failureCooldown = cooldown
+		if httpErr != nil {
+			log.Printf("iCloud 创建别名失败 account_id=%s upstream_status=%d upstream_body=%q", req.AccountID, httpErr.StatusCode, httpErr.Body)
 		} else {
-			fail(c, http.StatusBadGateway, "创建邮箱失败: "+msg)
+			log.Printf("iCloud 创建别名失败 account_id=%s error=%q", req.AccountID, err.Error())
 		}
+		failCreate(c, code, message, httpErr, cooldown)
 		return
 	}
 
@@ -136,12 +213,101 @@ func (s *Server) createAlias(c *gin.Context) {
 	})
 }
 
+func (s *Server) resolveCreateAccountID(accountID string) (string, int, error) {
+	if accountID = strings.TrimSpace(accountID); accountID != "" {
+		return accountID, 0, nil
+	}
+	accounts := s.mgr.ListAccounts()
+	switch len(accounts) {
+	case 0:
+		return "", http.StatusNotFound, errors.New("没有可用的 iCloud 账号")
+	case 1:
+		return accounts[0].ID, 0, nil
+	default:
+		return "", http.StatusBadRequest, errors.New("存在多个 iCloud 账号，请显式提供 account_id")
+	}
+}
+
+func (s *Server) beginCreate(accountID string) (time.Duration, bool) {
+	s.createMu.Lock()
+	defer s.createMu.Unlock()
+	now := s.now()
+	state := s.createAttempts[accountID]
+	if state == nil {
+		state = &createAttemptState{}
+		s.createAttempts[accountID] = state
+	}
+	if state.inFlight {
+		retryAfter := state.nextAllowed.Sub(now)
+		if retryAfter < time.Second {
+			retryAfter = time.Second
+		}
+		return retryAfter, false
+	}
+	if now.Before(state.nextAllowed) {
+		return state.nextAllowed.Sub(now), false
+	}
+	state.inFlight = true
+	state.nextAllowed = now.Add(s.createMinInterval)
+	return 0, true
+}
+
+func (s *Server) finishCreate(accountID string, failureCooldown time.Duration) {
+	s.createMu.Lock()
+	defer s.createMu.Unlock()
+	state := s.createAttempts[accountID]
+	if state == nil {
+		return
+	}
+	state.inFlight = false
+	if failureCooldown > 0 {
+		nextAllowed := s.now().Add(failureCooldown)
+		if nextAllowed.After(state.nextAllowed) {
+			state.nextAllowed = nextAllowed
+		}
+	}
+}
+
+func (s *Server) classifyCreateError(err error) (int, string, *hme.HTTPError, time.Duration) {
+	var httpErr *hme.HTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return http.StatusUnauthorized, "iCloud 会话失效，请更新 Cookie: " + err.Error(), httpErr, 0
+		case http.StatusTooManyRequests:
+			cooldown := maxDuration(s.createFailureCooldown, httpErr.RetryAfter)
+			return http.StatusTooManyRequests, "Apple 暂时限制了自动创建，请在冷却结束后重试: " + err.Error(), httpErr, cooldown
+		default:
+			return http.StatusFailedDependency, "Apple 创建接口失败: " + err.Error(), httpErr, s.createFailureCooldown
+		}
+	}
+	if isSessionError(err.Error()) {
+		return http.StatusUnauthorized, "iCloud 会话失效，请更新 Cookie: " + err.Error(), nil, 0
+	}
+	return http.StatusFailedDependency, "Apple 创建接口失败: " + err.Error(), nil, s.createFailureCooldown
+}
+
+func retryAfterSeconds(delay time.Duration) int64 {
+	if delay <= 0 {
+		return 0
+	}
+	return int64((delay + time.Second - 1) / time.Second)
+}
+
+func maxDuration(left, right time.Duration) time.Duration {
+	if right > left {
+		return right
+	}
+	return left
+}
+
 // ====================================================================
 // 核心接口 2: 读取邮件
-//   GET /api/inbox?account_id=acc_xxx[&alias=xxx@icloud.com][&limit=20][&days=7]
+//   GET /api/inbox?account_id=acc_xxx[&alias=xxx@icloud.com][&folder=all][&limit=20][&days=7]
 //
-//   - 不传 alias: 返回该账号收件箱最近邮件
-//   - 传 alias:   只返回发给该 HME 别名的邮件
+//   - folder: all(默认) / inbox / junk
+//   - 不传 alias: 返回指定邮件夹最近邮件
+//   - 传 alias:   在指定邮件夹中查找发给该 HME 别名的邮件
 //
 //   认证优先级: IMAP (App Password) 优先 > Web API (Cookie) 回退
 //   - IMAP: 支持服务端按收件人搜索 (FindByRecipient)
@@ -157,22 +323,29 @@ func (s *Server) listInbox(c *gin.Context) {
 	alias := strings.TrimSpace(c.Query("alias"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
 	days, _ := strconv.Atoi(c.DefaultQuery("days", "7"))
+	folder, err := mail.NormalizeFolder(c.DefaultQuery("folder", mail.FolderAll))
+	if err != nil {
+		fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// 优先使用 IMAP (App Password 认证)
+	var imapErr error
 	mc, err := s.mgr.MailClient(accountID)
 	if err == nil {
 		if connErr := mc.Connect(); connErr == nil {
 			defer mc.Disconnect()
 			var messages []mail.Message
 			if alias != "" {
-				messages, err = mc.FindByRecipient(alias, limit, days)
+				messages, err = mc.FindByRecipientInFolder(alias, folder, limit, days)
 			} else {
-				messages, err = mc.ListInbox(limit, days)
+				messages, err = mc.ListMessages(folder, limit, days)
 			}
 			if err == nil {
 				ok(c, gin.H{
 					"account_id": accountID,
 					"alias":      alias,
+					"folder":     folder,
 					"count":      len(messages),
 					"messages":   messages,
 					"method":     "imap",
@@ -180,25 +353,40 @@ func (s *Server) listInbox(c *gin.Context) {
 				return
 			}
 			// IMAP 失败，继续尝试 Web API
+			imapErr = err
+		} else {
+			imapErr = connErr
 		}
+	} else {
+		imapErr = err
+	}
+	if folder != mail.FolderInbox {
+		message := "查询全部邮件和垃圾邮件需要可用的 iCloud IMAP App Password"
+		if imapErr != nil {
+			message += ": " + imapErr.Error()
+		}
+		fail(c, http.StatusFailedDependency, message)
+		return
 	}
 
-	// 回退到 Web API (Cookie 认证，无需 App Password)
+	// Web API 只支持 INBOX，因此仅在 folder=inbox 时回退。
 	wmc, err := s.mgr.WebMailClient(accountID)
 	if err != nil {
-		fail(c, http.StatusBadRequest, "无可用邮件客户端: 需要 App Password 或 Cookie")
+		fail(c, http.StatusFailedDependency, inboxClientError(imapErr, err))
 		return
 	}
 
 	if alias != "" {
 		messages, err := wmc.FindByAlias(alias, limit)
 		if err != nil {
-			fail(c, http.StatusBadGateway, "读取邮件失败: "+err.Error())
+			fail(c, http.StatusFailedDependency, inboxClientError(imapErr, err))
 			return
 		}
+		setMessagesFolder(messages, mail.FolderInbox)
 		ok(c, gin.H{
 			"account_id": accountID,
 			"alias":      alias,
+			"folder":     folder,
 			"count":      len(messages),
 			"messages":   messages,
 			"method":     "web_api",
@@ -206,16 +394,40 @@ func (s *Server) listInbox(c *gin.Context) {
 	} else {
 		messages, err := wmc.ListInbox(limit)
 		if err != nil {
-			fail(c, http.StatusBadGateway, "读取邮件失败: "+err.Error())
+			fail(c, http.StatusFailedDependency, inboxClientError(imapErr, err))
 			return
 		}
+		setMessagesFolder(messages, mail.FolderInbox)
 		ok(c, gin.H{
 			"account_id": accountID,
+			"folder":     folder,
 			"count":      len(messages),
 			"messages":   messages,
 			"method":     "web_api",
 		})
 	}
+}
+
+func setMessagesFolder(messages []mail.Message, folder string) {
+	for i := range messages {
+		messages[i].Folder = folder
+	}
+}
+
+func inboxClientError(imapErr, webErr error) string {
+	if imapErr != nil {
+		message := strings.ToLower(imapErr.Error())
+		if strings.Contains(message, "app") && strings.Contains(message, "密码") {
+			return "当前账号未设置或未能使用 App 专用密码，且 Cookie Web 邮件接口不可用。请在账号列表点击钥匙图标设置 App Password 后重试。"
+		}
+	}
+	if webErr != nil {
+		return "读取邮件失败: " + webErr.Error()
+	}
+	if imapErr != nil {
+		return "读取邮件失败: " + imapErr.Error()
+	}
+	return "读取邮件失败: 未知错误"
 }
 
 // ====================================================================
@@ -227,16 +439,16 @@ func (s *Server) listAccounts(c *gin.Context) {
 }
 
 type addAccountReq struct {
-	Name     string `json:"name" binding:"required"`
-	Cookies  string `json:"cookies"` // 可选,后续可通过 /login 获取
-	Host     string `json:"host"`
-	Proxy    string `json:"proxy"` // HTTP/SOCKS5 代理
+	Name    string `json:"name" binding:"required"`
+	Cookies string `json:"cookies" binding:"required"`
+	Host    string `json:"host"`
+	Proxy   string `json:"proxy"` // HTTP/SOCKS5 代理
 }
 
 func (s *Server) addAccount(c *gin.Context) {
 	var req addAccountReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, http.StatusBadRequest, "参数错误: name 必填 — "+err.Error())
+		fail(c, http.StatusBadRequest, "参数错误: name、cookies 必填 — "+err.Error())
 		return
 	}
 	acc, err := s.mgr.AddAccount(req.Name, req.Cookies, req.Host, req.Proxy)
@@ -244,9 +456,12 @@ func (s *Server) addAccount(c *gin.Context) {
 		fail(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	// 返回时脱敏
-	acc.Cookies = nil
-	c.JSON(http.StatusCreated, apiResp{Success: true, Data: acc})
+	// 返回脱敏副本，不能修改 Manager 持有的账号对象。
+	publicAccount := *acc
+	publicAccount.Cookies = nil
+	publicAccount.AppPassword = ""
+	publicAccount.HMEClientID = ""
+	c.JSON(http.StatusCreated, apiResp{Success: true, Data: &publicAccount})
 }
 
 func (s *Server) removeAccount(c *gin.Context) {
@@ -295,43 +510,6 @@ func (s *Server) updateCookies(c *gin.Context) {
 	ok(c, gin.H{"id": id, "cookies_count": len(req.Cookies)})
 }
 
-type loginReq struct {
-	Password string `json:"password" binding:"required"`
-	OTPCode  string `json:"otp_code"` // 可选 2FA 验证码
-}
-
-func (s *Server) loginAccount(c *gin.Context) {
-	id := c.Param("id")
-	var req loginReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, http.StatusBadRequest, "参数错误: password 必填 — "+err.Error())
-		return
-	}
-
-	var otpProvider hme.OTPProvider
-	if req.OTPCode != "" {
-		otp := req.OTPCode
-		otpProvider = func() (string, error) {
-			return otp, nil
-		}
-	}
-
-	client, err := s.mgr.HMEClientWithPassword(id, req.Password, otpProvider)
-	if err != nil {
-		if isSessionError(err.Error()) {
-			fail(c, http.StatusUnauthorized, err.Error())
-		} else {
-			fail(c, http.StatusBadGateway, "登录失败: "+err.Error())
-		}
-		return
-	}
-
-	ok(c, gin.H{
-		"id":      id,
-		"cookies": client.Cookies,
-	})
-}
-
 func (s *Server) listAliases(c *gin.Context) {
 	accountID := c.Query("account_id")
 	if accountID == "" {
@@ -344,13 +522,17 @@ func (s *Server) listAliases(c *gin.Context) {
 		return
 	}
 	aliases, err := client.ListAliases()
-	_ = s.mgr.SaveCookies(accountID, client.Cookies)
 	if err != nil {
+		_ = s.mgr.SaveCookies(accountID, client.Cookies)
 		if isSessionError(err.Error()) {
 			fail(c, http.StatusUnauthorized, "iCloud 会话失效,请更新 Cookie: "+err.Error())
 		} else {
 			fail(c, http.StatusBadGateway, err.Error())
 		}
+		return
+	}
+	if err := s.mgr.SaveAliasStats(accountID, aliases, client.Cookies); err != nil {
+		fail(c, http.StatusInternalServerError, "保存别名统计失败: "+err.Error())
 		return
 	}
 	ok(c, gin.H{
@@ -450,6 +632,3 @@ func (s *Server) reloadConfig(c *gin.Context) {
 	}
 	ok(c, gin.H{"message": "配置已重新加载"})
 }
-
-// 确保 hme 包被引用(类型在 handler 中使用)
-var _ = hme.Alias{}

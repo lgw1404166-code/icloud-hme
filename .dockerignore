@@ -1,0 +1,7 @@
+.git
+.gitignore
+.dockerignore
+compose.yaml
+data
+deploy
+*.exe

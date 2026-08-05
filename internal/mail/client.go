@@ -11,6 +11,7 @@ import (
 	"mime/quotedprintable"
 	"net/mail"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +23,13 @@ import (
 const (
 	IMAPServer = "imap.mail.me.com"
 	IMAPPort   = 993
+
+	FolderAll   = "all"
+	FolderInbox = "inbox"
+	FolderJunk  = "junk"
+
+	inboxMailbox = "INBOX"
+	junkMailbox  = "Junk"
 )
 
 // Message 是一封邮件的摘要信息。
@@ -32,6 +40,21 @@ type Message struct {
 	Subject string `json:"subject"`
 	Date    string `json:"date"`
 	Preview string `json:"preview"`
+	Folder  string `json:"folder,omitempty"`
+}
+
+// NormalizeFolder 规范化 API 邮件夹值。空值默认查询全部邮件。
+func NormalizeFolder(folder string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(folder)) {
+	case "", FolderAll:
+		return FolderAll, nil
+	case FolderInbox:
+		return FolderInbox, nil
+	case FolderJunk:
+		return FolderJunk, nil
+	default:
+		return "", fmt.Errorf("不支持的邮件夹: %s (可选 all、inbox、junk)", folder)
+	}
 }
 
 // FullMessage 是一封邮件的完整内容(含正文)。
@@ -87,19 +110,40 @@ func (c *Client) InboxCount() (int, error) {
 	return int(mbox.Messages), nil
 }
 
-// ListInbox 拉取收件箱最近 limit 封邮件摘要。
-//
-// days 用于过滤只看近 N 天的邮件(0 表示不限制)。
-// 返回按时间倒序排列。
+// ListInbox 拉取 INBOX 最近邮件，保留原有调用语义。
 func (c *Client) ListInbox(limit int, days int) ([]Message, error) {
+	return c.ListMessages(FolderInbox, limit, days)
+}
+
+// ListMessages 拉取指定邮件夹最近邮件。folder 为空时默认查询 INBOX 和 Junk。
+func (c *Client) ListMessages(folder string, limit int, days int) ([]Message, error) {
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
 	if limit <= 0 {
 		limit = 50
 	}
+	folder, err := NormalizeFolder(folder)
+	if err != nil {
+		return nil, err
+	}
+	if folder == FolderAll {
+		inbox, err := c.listMailbox(inboxMailbox, FolderInbox, limit, days)
+		if err != nil {
+			return nil, fmt.Errorf("读取收件箱失败: %w", err)
+		}
+		junk, err := c.listMailbox(junkMailbox, FolderJunk, limit, days)
+		if err != nil {
+			return nil, fmt.Errorf("读取垃圾邮件失败: %w", err)
+		}
+		return mergeMessages(limit, inbox, junk), nil
+	}
+	mailbox, _ := mailboxForFolder(folder)
+	return c.listMailbox(mailbox, folder, limit, days)
+}
 
-	mbox, err := c.cli.Select("INBOX", true)
+func (c *Client) listMailbox(mailbox, folder string, limit, days int) ([]Message, error) {
+	mbox, err := c.cli.Select(mailbox, true)
 	if err != nil {
 		return nil, err
 	}
@@ -132,38 +176,60 @@ func (c *Client) ListInbox(limit int, days int) ([]Message, error) {
 		done <- c.cli.Fetch(seqset, items, messages)
 	}()
 
-	var out []Message
+	out := make([]Message, 0, limit)
 	for msg := range messages {
 		m := toMessageWithBody(msg)
-		// days 过滤
-		if days > 0 {
-			if t, err := time.Parse(time.RFC1123Z, m.Date); err == nil {
-				if time.Since(t) > time.Duration(days)*24*time.Hour {
-					continue
-				}
-			}
+		setMessageFolder(&m, folder)
+		if !messageWithinDays(m, days) {
+			continue
 		}
 		out = append(out, m)
 	}
 	if err := <-done; err != nil {
 		return nil, err
 	}
+	sortMessages(out)
 	return out, nil
 }
 
 // FindByRecipient 查找发给指定隐私邮箱别名的邮件。
 //
-// 先尝试 IMAP TO 搜索;失败则拉取收件箱后本地过滤。
+// 保留原有调用语义，仅查询 INBOX。
 func (c *Client) FindByRecipient(recipient string, limit int, days int) ([]Message, error) {
+	return c.FindByRecipientInFolder(recipient, FolderInbox, limit, days)
+}
+
+// FindByRecipientInFolder 在指定邮件夹查找收件人。folder 为空时查询 INBOX 和 Junk。
+func (c *Client) FindByRecipientInFolder(recipient, folder string, limit int, days int) ([]Message, error) {
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
 	if limit <= 0 {
 		limit = 20
 	}
+	folder, err := NormalizeFolder(folder)
+	if err != nil {
+		return nil, err
+	}
+	if folder == FolderAll {
+		inbox, err := c.findByRecipientMailbox(recipient, inboxMailbox, FolderInbox, limit, days)
+		if err != nil {
+			return nil, fmt.Errorf("搜索收件箱失败: %w", err)
+		}
+		junk, err := c.findByRecipientMailbox(recipient, junkMailbox, FolderJunk, limit, days)
+		if err != nil {
+			return nil, fmt.Errorf("搜索垃圾邮件失败: %w", err)
+		}
+		return mergeMessages(limit, inbox, junk), nil
+	}
+	mailbox, _ := mailboxForFolder(folder)
+	return c.findByRecipientMailbox(recipient, mailbox, folder, limit, days)
+}
 
+// findByRecipientMailbox 先尝试 IMAP TO 搜索，失败则拉取邮件后本地过滤。
+func (c *Client) findByRecipientMailbox(recipient, mailbox, folder string, limit int, days int) ([]Message, error) {
 	// 先尝试服务端 TO 搜索
-	mbox, err := c.cli.Select("INBOX", true)
+	_, err := c.cli.Select(mailbox, true)
 	if err != nil {
 		return nil, err
 	}
@@ -175,17 +241,16 @@ func (c *Client) FindByRecipient(recipient string, limit int, days int) ([]Messa
 	}
 	uids, err := c.cli.UidSearch(criteria)
 	if err == nil && len(uids) > 0 {
-		return c.fetchByUIDs(uids, limit)
+		return c.fetchByUIDs(uids, limit, folder)
 	}
-	_ = mbox
 
-	// fallback: 拉取收件箱后本地过滤
-	all, err := c.ListInbox(limit*3, days)
+	// fallback: 拉取当前邮件夹后本地过滤
+	all, err := c.listMailbox(mailbox, folder, limit*3, days)
 	if err != nil {
 		return nil, err
 	}
 	recipient = strings.ToLower(recipient)
-	var out []Message
+	out := make([]Message, 0, limit)
 	for _, m := range all {
 		if strings.Contains(strings.ToLower(m.To), recipient) {
 			out = append(out, m)
@@ -197,7 +262,7 @@ func (c *Client) FindByRecipient(recipient string, limit int, days int) ([]Messa
 	return out, nil
 }
 
-func (c *Client) fetchByUIDs(uids []uint32, limit int) ([]Message, error) {
+func (c *Client) fetchByUIDs(uids []uint32, limit int, folder string) ([]Message, error) {
 	if len(uids) == 0 {
 		return []Message{}, nil
 	}
@@ -219,14 +284,85 @@ func (c *Client) fetchByUIDs(uids []uint32, limit int) ([]Message, error) {
 		done <- c.cli.UidFetch(seqset, items, messages)
 	}()
 
-	var out []Message
+	out := make([]Message, 0, len(uids))
 	for msg := range messages {
-		out = append(out, toMessageWithBody(msg))
+		m := toMessageWithBody(msg)
+		setMessageFolder(&m, folder)
+		out = append(out, m)
 	}
 	if err := <-done; err != nil {
 		return nil, err
 	}
+	sortMessages(out)
 	return out, nil
+}
+
+func mailboxForFolder(folder string) (string, error) {
+	switch folder {
+	case FolderInbox:
+		return inboxMailbox, nil
+	case FolderJunk:
+		return junkMailbox, nil
+	default:
+		return "", fmt.Errorf("邮件夹 %s 没有单一 IMAP 邮箱", folder)
+	}
+}
+
+func setMessageFolder(message *Message, folder string) {
+	message.Folder = folder
+	if message.ID != "" && !strings.Contains(message.ID, ":") {
+		message.ID = folder + ":" + message.ID
+	}
+}
+
+func mergeMessages(limit int, groups ...[]Message) []Message {
+	total := 0
+	for _, group := range groups {
+		total += len(group)
+	}
+	merged := make([]Message, 0, total)
+	for _, group := range groups {
+		merged = append(merged, group...)
+	}
+	sortMessages(merged)
+	if limit > 0 && len(merged) > limit {
+		merged = merged[:limit]
+	}
+	return merged
+}
+
+func sortMessages(messages []Message) {
+	sort.SliceStable(messages, func(i, j int) bool {
+		left, leftOK := messageTime(messages[i])
+		right, rightOK := messageTime(messages[j])
+		if leftOK && rightOK && !left.Equal(right) {
+			return left.After(right)
+		}
+		if leftOK != rightOK {
+			return leftOK
+		}
+		return messages[i].ID > messages[j].ID
+	})
+}
+
+func messageWithinDays(message Message, days int) bool {
+	if days <= 0 {
+		return true
+	}
+	timestamp, ok := messageTime(message)
+	if !ok {
+		return true
+	}
+	return !timestamp.Before(time.Now().Add(-time.Duration(days) * 24 * time.Hour))
+}
+
+func messageTime(message Message) (time.Time, bool) {
+	for _, layout := range []string{time.RFC3339, time.RFC1123Z, time.RFC1123} {
+		if parsed, err := time.Parse(layout, message.Date); err == nil {
+			return parsed, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // GetFull 获取单封邮件的完整内容(含正文)。

@@ -89,7 +89,15 @@ go build -o icloud-hme.exe .
 }
 ```
 
-> **提示:** 也可以通过 API 动态添加账号，无需手动编辑 JSON 文件。`cookies` 和 `app_password` 都是可选的，`proxy` 也是可选的。
+> **提示:** 也可以通过管理页面或 API 动态添加账号。创建账号时必须提供浏览器导出的 Cookie；`app_password` 和 `proxy` 仍是可选的。
+
+### 手动导入 Cookie
+
+1. 在 Chrome 或 Edge 中打开 `https://www.icloud.com/`，完成 Apple 登录和双重认证。
+2. 使用浏览器的 Cookie 导出工具导出 `icloud.com` / `www.icloud.com` 的全部 Cookie，或从 iCloud 请求的 `Cookie` 请求头复制完整内容。
+3. 在管理页面点击“添加账号”，粘贴 Cookie JSON 或 `name=value; name2=value2` 格式，提交后服务会立即校验。
+
+Cookie 是 iCloud 的临时会话凭据，不要发送给第三方；失效后可在账号列表使用“更新 Cookie”重新导入。
 
 ### 3. 启动服务
 
@@ -139,11 +147,12 @@ POST /api/create
 #### 读取邮件
 
 ```bash
-GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&limit=20&days=7
+GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&folder=all&limit=20&days=7
 
 # 参数说明:
 #   account_id - 必填: 账号 ID
 #   alias      - 可选: 只读取发到该别名的邮件
+#   folder     - 可选: all/inbox/junk (默认 all)
 #   limit      - 可选: 返回邮件数量 (默认 20)
 #   days       - 可选: 查找最近几天的邮件 (默认 7,仅 IMAP 模式)
 
@@ -192,38 +201,13 @@ GET /api/accounts
 
 #### 添加账号
 
-**简化版（cookies 可选）:**
-
 ```bash
 POST /api/accounts
 
 # 请求体
 {
   "name": "新账号",
-  "host": "icloud.com",           # 可选
-  "proxy": "http://..."           # 可选
-}
-
-# 响应 - 状态为 pending,需登录
-{
-  "success": true,
-  "data": {
-    "id": "acc_xxx",
-    "name": "新账号",
-    "status": "pending"
-  }
-}
-```
-
-**完整版（带 Cookie）:**
-
-```bash
-POST /api/accounts
-
-# 请求体
-{
-  "name": "新账号",
-  "cookies": "{\"x-apple-session-token\":\"token_value\"}",  # JSON 或 Header 格式
+  "cookies": "{\"x-apple-session-token\":\"token_value\"}",  # 必填，JSON 或 Header 格式
   "host": "icloud.com",           # 可选
   "proxy": "http://..."           # 可选
 }
@@ -235,30 +219,6 @@ POST /api/accounts
     "id": "acc_3",
     "name": "新账号",
     "status": "active"
-  }
-}
-```
-
-#### 账号登录（获取 Cookie）
-
-```bash
-POST /api/accounts/:id/login
-
-# 请求体
-{
-  "password": "用户的常规iCloud密码",  # 不是 App Password
-  "otp_code": "123456"                  # 可选,2FA 验证码
-}
-
-# 响应
-{
-  "success": true,
-  "data": {
-    "id": "acc_1",
-    "cookies": {
-      "x-apple-session-token": "...",
-      "X-APPLE-WEBAUTH-TOKEN": "..."
-    }
   }
 }
 ```
@@ -392,9 +352,8 @@ Cookie 认证可实现所有功能:创建别名、读取邮件、管理别名。
 **获取 Cookie:**
 
 1. 使用浏览器登录 [icloud.com](https://www.icloud.com) 或 [icloud.com.cn](https://www.icloud.com.cn) (国区)
-2. 打开浏览器开发者工具 (F12)
-3. 进入 Application → Cookies
-4. 导出全部 Cookie 为 `{"key":"value"}` 格式的 JSON
+2. 使用可信的 Cookie 导出工具导出 `icloud.com` / `www.icloud.com` 的全部 Cookie，或从 iCloud 请求的 `Cookie` 请求头复制完整内容
+3. 导出为 `{"key":"value"}` 对象、`[{"name":"key","value":"value"}]` 数组，或 `name=value; name2=value2` Header 格式
 
 **关键 Cookie (必需):**
 - `X-APPLE-WEBAUTH-TOKEN` — 认证 token
@@ -416,10 +375,10 @@ App Password 用于 IMAP 读取邮件,是邮件读取的优先路径 (支持服�
 
 ### 邮件读取双路径
 
-`GET /api/inbox` 自动选择读取方式:
+`GET /api/inbox` 默认同时查询 `INBOX` 和 `Junk`，可用 `folder=all|inbox|junk` 选择范围:
 
 1. **优先: IMAP (App Password)** — 设置了 App Password 时使用,支持服务端按收件人 (`TO`) 搜索
-2. **回退: Web API (Cookie)** — 无 App Password 或 IMAP 失败时,通过 `mccgateway` 端点读取,本地按别名过滤
+2. **回退: Web API (Cookie)** — 仅 `folder=inbox` 支持;`all` 和 `junk` 必须使用 IMAP
 
 响应中包含 `"method": "web_api"` 或 `"method": "imap"` 字段,标识实际使用的读取方式。
 
@@ -434,8 +393,7 @@ icloud-hme/
     ├── account/
     │   └── manager.go      # 多账号管理器 (持久化、客户端工厂)
     ├── hme/
-    │   ├── client.go       # iCloud HME Web 客户端 (Cookie 认证)
-    │   └── auth.go         # SRP 登录 (账号密码 + 2FA 获取 Cookie)
+    │   └── client.go       # iCloud HME Web 客户端 (Cookie 认证)
     ├── mail/
     │   ├── client.go       # IMAP 邮件客户端 (App Password 认证)
     │   └── web_client.go   # Web 邮件客户端 (Cookie 认证,无需 App Password)
@@ -447,7 +405,6 @@ icloud-hme/
 
 - **account.Manager**: 管理多个 iCloud 账号,负责配置持久化和客户端创建
 - **hme.Client**: 封装 iCloud HME Web API,支持 Cookie 认证
-- **hme.auth**: SRP 协议登录,支持账号密码 + 可选 2FA
 - **mail.Client**: IMAP 邮件客户端 (App Password,优先读邮件)
 - **mail.WebClient**: 通过 iCloud Web API (mccgateway) 读取邮件,无需 App Password
 - **server.Server**: HTTP API 服务,提供 RESTful 接口
@@ -471,7 +428,7 @@ icloud-hme/
 
 ### Q: 如何查看某个别名收到了哪些邮件?
 
-**A:** 调用 `GET /api/inbox?account_id=acc_1&alias=your_alias@icloud.com`
+**A:** 调用 `GET /api/inbox?account_id=acc_1&alias=your_alias@icloud.com&folder=all`，默认同时搜索收件箱和垃圾邮件。
 
 ### Q: 支持同时管理多个 iCloud 账号吗?
 

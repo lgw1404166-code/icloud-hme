@@ -12,6 +12,8 @@ CLAUDE.md
 # Claude sessions
 /.claude/
 *.js
+!/internal/server/web/assets/app.js
+!/internal/server/web/assets/lucide.min.js
 docs/
 .superpowers/
 !capture_statsig_pair.js

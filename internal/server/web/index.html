@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#173f38">
+  <title>iCloud HME</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="iCloud HME 首页">
+        <span class="brand-mark"><i data-lucide="cloud-cog"></i></span>
+        <span class="brand-copy"><strong>iCloud HME</strong><small>Control</small></span>
+      </a>
+
+      <nav class="primary-nav" aria-label="主导航">
+        <button class="nav-item is-active" type="button" data-view-target="accounts" aria-current="page">
+          <i data-lucide="users"></i><span>账号</span>
+        </button>
+        <button class="nav-item" type="button" data-view-target="aliases">
+          <i data-lucide="at-sign"></i><span>别名</span>
+        </button>
+        <button class="nav-item" type="button" data-view-target="inbox">
+          <i data-lucide="inbox"></i><span>收件箱</span>
+        </button>
+      </nav>
+
+      <div class="service-state">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span><strong id="service-status">服务在线</strong><small>API connected</small></span>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <div class="page-heading">
+          <span class="eyebrow">iCloud Hide My Email</span>
+          <h1 id="page-title">账号</h1>
+        </div>
+        <div class="topbar-actions">
+          <label class="account-switcher" for="global-account-select">
+            <span>当前账号</span>
+            <select id="global-account-select" aria-label="当前账号"></select>
+          </label>
+          <button class="icon-button" type="button" id="refresh-view" title="刷新当前页面" aria-label="刷新当前页面">
+            <i data-lucide="refresh-cw"></i>
+          </button>
+        </div>
+      </header>
+
+      <div class="content">
+        <section class="view is-active" id="view-accounts" data-view="accounts">
+          <div class="metric-grid" aria-label="账号统计">
+            <article class="metric-item">
+              <span class="metric-icon tone-green"><i data-lucide="users"></i></span>
+              <span><small>账号总数</small><strong id="metric-accounts">0</strong></span>
+            </article>
+            <article class="metric-item">
+              <span class="metric-icon tone-teal"><i data-lucide="circle-check-big"></i></span>
+              <span><small>正常账号</small><strong id="metric-active">0</strong></span>
+            </article>
+            <article class="metric-item">
+              <span class="metric-icon tone-amber"><i data-lucide="at-sign"></i></span>
+              <span><small>有效别名</small><strong id="metric-aliases">0</strong></span>
+            </article>
+          </div>
+
+          <div class="section-heading">
+            <div><h2>账号列表</h2><p id="accounts-summary">0 个账号</p></div>
+            <div class="command-row">
+              <button class="button button-secondary" type="button" data-action="reload-config">
+                <i data-lucide="database-backup"></i><span>重载配置</span>
+              </button>
+              <button class="button button-primary" type="button" data-action="add-account">
+                <i data-lucide="user-plus"></i><span>添加账号</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="table-shell" id="accounts-table-shell">
+            <table>
+              <thead><tr><th>账号</th><th>状态</th><th>域</th><th>别名</th><th>最近验证</th><th class="align-right">操作</th></tr></thead>
+              <tbody id="accounts-body"></tbody>
+            </table>
+          </div>
+          <div class="empty-state" id="accounts-empty" hidden>
+            <span class="empty-icon"><i data-lucide="user-round-plus"></i></span>
+            <h3>暂无账号</h3>
+            <button class="button button-primary" type="button" data-action="add-account"><i data-lucide="plus"></i><span>添加账号</span></button>
+          </div>
+        </section>
+
+        <section class="view" id="view-aliases" data-view="aliases" hidden>
+          <div class="section-heading section-heading-sticky">
+            <div><h2>邮箱别名</h2><p id="aliases-summary">选择账号后加载</p></div>
+            <button class="button button-primary" type="button" data-action="create-alias" id="create-alias-button">
+              <i data-lucide="plus"></i><span>创建别名</span>
+            </button>
+          </div>
+
+          <div class="filter-bar">
+            <label class="search-control">
+              <i data-lucide="search"></i>
+              <input id="alias-search" type="search" placeholder="搜索邮箱或标签" autocomplete="off">
+            </label>
+            <div class="segmented-control" id="alias-status-filter" aria-label="别名状态">
+              <button type="button" class="is-selected" data-alias-filter="all">全部</button>
+              <button type="button" data-alias-filter="active">使用中</button>
+              <button type="button" data-alias-filter="inactive">已停用</button>
+            </div>
+          </div>
+
+          <div class="table-shell" id="aliases-table-shell">
+            <table>
+              <thead><tr><th>邮箱地址</th><th>标签</th><th>状态</th><th>创建时间</th><th class="align-right">操作</th></tr></thead>
+              <tbody id="aliases-body"></tbody>
+            </table>
+          </div>
+          <div class="empty-state" id="aliases-empty" hidden>
+            <span class="empty-icon"><i data-lucide="at-sign"></i></span>
+            <h3 id="aliases-empty-title">暂无别名</h3>
+            <button class="button button-primary" type="button" data-action="create-alias"><i data-lucide="plus"></i><span>创建别名</span></button>
+          </div>
+        </section>
+
+        <section class="view" id="view-inbox" data-view="inbox" hidden>
+          <div class="section-heading">
+            <div><h2>收件箱</h2><p id="inbox-summary">选择账号后查询</p></div>
+          </div>
+
+          <form class="inbox-filters" id="inbox-filter-form">
+            <label><span>邮箱别名</span><select id="inbox-alias"><option value="">全部邮件</option></select></label>
+            <div class="inbox-folder-control">
+              <span>邮件夹</span>
+              <div class="segmented-control" id="inbox-folder-filter" role="group" aria-label="邮件夹">
+                <button type="button" class="is-selected" data-inbox-folder="all">全部邮件</button>
+                <button type="button" data-inbox-folder="inbox">收件箱</button>
+                <button type="button" data-inbox-folder="junk">垃圾邮件</button>
+              </div>
+            </div>
+            <label><span>时间范围</span><select id="inbox-days"><option value="1">最近 1 天</option><option value="3">最近 3 天</option><option value="7" selected>最近 7 天</option><option value="30">最近 30 天</option></select></label>
+            <label><span>数量</span><select id="inbox-limit"><option value="10">10 封</option><option value="20" selected>20 封</option><option value="50">50 封</option><option value="100">100 封</option></select></label>
+            <button class="button button-primary" type="submit"><i data-lucide="search"></i><span>查询邮件</span></button>
+          </form>
+
+          <div class="mail-layout">
+            <div class="mail-list" id="mail-list" aria-label="邮件列表"></div>
+            <article class="mail-detail" id="mail-detail">
+              <div class="mail-detail-empty">
+                <span class="empty-icon"><i data-lucide="mail-open"></i></span>
+                <h3>选择一封邮件</h3>
+              </div>
+            </article>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <dialog class="modal" id="editor-dialog">
+    <form id="editor-form">
+      <header class="modal-header">
+        <div><span class="eyebrow" id="modal-eyebrow">账号</span><h2 id="modal-title">添加账号</h2></div>
+        <button class="icon-button" type="button" data-dialog-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+      </header>
+      <div class="modal-body" id="modal-body"></div>
+      <footer class="modal-footer">
+        <button class="button button-secondary" type="button" data-dialog-close>取消</button>
+        <button class="button button-primary" type="submit" id="modal-submit"><span>保存</span></button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="modal modal-confirm" id="confirm-dialog">
+    <form id="confirm-form">
+      <div class="confirm-symbol"><i data-lucide="triangle-alert"></i></div>
+      <h2 id="confirm-title">确认操作</h2>
+      <p id="confirm-message"></p>
+      <footer class="modal-footer">
+        <button class="button button-secondary" type="button" data-confirm-cancel>取消</button>
+        <button class="button button-danger" type="submit" id="confirm-submit">确认</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <script src="/assets/lucide.min.js"></script>
+  <script src="/assets/app.js"></script>
+</body>
+</html>
