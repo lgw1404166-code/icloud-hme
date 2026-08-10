@@ -6,9 +6,10 @@
 
 ## 功能特性
 
-- ✅ **创建 HME 别名** — 自动生成 iCloud 隐藏邮箱地址
+- ✅ **后台别名池** — 服务按固定速率预创建 iCloud 隐藏邮箱地址，调用方只领取本地池中的邮箱
 - ✅ **列出所有别名** — 查看账号下的所有 HME 别名
-- ✅ **收取邮件** — 通过 IMAP 或 Web API 读取发到 HME 别名的邮件
+- ✅ **调用方去重** — `chatgpt`、`ChatGPT` 等大小写视为同一身份，同一调用方不会重复拿到已领取过的别名
+- ✅ **收取邮件** — 通过 IMAP 或 Web API 读取发到 HME 别名的邮件，列表只读摘要，点击后按需加载正文/HTML
 - ✅ **双路径读信** — 邮件读取优先走 IMAP (App Password),无 App Password 时回退 Web API (Cookie)
 - ✅ **多账号管理** — 支持多个 iCloud 账号并行管理
 - ✅ **双认证模式** — Cookie (创建别名 + 读邮件回退) 和 App Password (IMAP 优先)
@@ -93,11 +94,101 @@ go build -o icloud-hme.exe .
 
 ### 手动导入 Cookie
 
-1. 在 Chrome 或 Edge 中打开 `https://www.icloud.com/`，完成 Apple 登录和双重认证。
-2. 使用浏览器的 Cookie 导出工具导出 `icloud.com` / `www.icloud.com` 的全部 Cookie，或从 iCloud 请求的 `Cookie` 请求头复制完整内容。
+1. 在 Chrome 或 Edge 中登录 iCloud，并打开 `https://account.apple.com/account/manage/section/privacy` 完成 Apple 账户登录。
+2. 使用浏览器的 Cookie 导出工具同时导出 `icloud.com` / `www.icloud.com` 与 `account.apple.com` / `appleid.apple.com` 的 Cookie；优先使用带 `domain` 的浏览器导出数组。
 3. 在管理页面点击“添加账号”，粘贴 Cookie JSON 或 `name=value; name2=value2` 格式，提交后服务会立即校验。
 
 Cookie 是 iCloud 的临时会话凭据，不要发送给第三方；失效后可在账号列表使用“更新 Cookie”重新导入。
+
+Apple 账户管理接口会在 `/account/manage/gs/ws/token` 响应中下发滚动会话 Cookie（当前观察到 `caw-at`、`awat` 的 `Max-Age=900`）。服务会同步响应中的 `scnt` 与 CookieJar 新值，因此在持续调用期间会自动滚动；长时间空闲超过 Apple 的账户管理会话窗口后，仍需在账户页重新登录并更新 Cookie。该会话没有可由 App Password 替代的永久令牌。
+
+服务默认每 10 分钟主动刷新一次 Apple 账户管理会话，避免没有业务请求时短 Cookie 到期。通过 `ICLOUD_HME_ACCOUNT_REFRESH_INTERVAL` 调整间隔（例如 `8m`）；设为 `0` 或 `off` 可关闭。保活要求服务持续运行，已经过期或被 Apple 注销的根会话仍需重新登录。
+
+### 后台别名池
+
+外部调用方不再直接触发 Apple 创建请求。服务启动后会按后台节奏预创建别名并保存到本地池，`POST /api/create` 只负责按调用方身份领取一个“该调用方尚未使用过”的邮箱。
+
+可用环境变量：
+
+- `ICLOUD_HME_AUTO_CREATE`：默认开启；设为 `0` / `off` / `false` 关闭后台创建。
+- `ICLOUD_HME_AUTO_CREATE_PER_HOUR`：默认 `10`，表示每小时每个账号最多创建 10 个（默认约 6 分钟 1 个）。
+- `ICLOUD_HME_AUTO_CREATE_INTERVAL`：直接指定创建间隔，例如 `6m`；设置后优先于 `PER_HOUR`。
+- `ICLOUD_HME_AUTO_CREATE_MAX_TOTAL`：单账号本地最多保留多少别名，`0` 表示不设本地上限。
+- `ICLOUD_HME_AUTO_CREATE_LABEL` / `ICLOUD_HME_AUTO_CREATE_NOTE`：后台创建时写入 Apple 侧的标签/备注。
+
+当 Apple 根登录态过期时，管理页面会弹窗提示重新登录；点击确定会打开 `https://account.apple.com/account/manage/section/privacy`，登录完成后回到管理页面更新 Cookie。
+
+### 纯协议自动重新登录 + OTP
+
+这组配置合并在一起，默认关闭：
+
+- 直接运行 `build/icloud-hme.exe` 时会自动读取项目根目录 `.env`；系统环境变量优先级更高，不会被 `.env` 覆盖。
+- `ICLOUD_HME_RELOGIN_ENABLED`：总开关，关闭时继续使用手动登录弹窗。
+- `ICLOUD_HME_RELOGIN_MODE`：默认 `apple_protocol_sms`。
+- `ICLOUD_HME_RELOGIN_APPLE_ID` / `ICLOUD_HME_RELOGIN_APPLE_PASSWORD`：纯协议自动登录所需账号信息。
+- `ICLOUD_HME_RELOGIN_OTP_PROVIDER`：默认 `smsgate_webhook`。
+- `ICLOUD_HME_RELOGIN_OTP_WEBHOOK_TOKEN`：SMSGate webhook token。
+- `ICLOUD_HME_RELOGIN_OTP_TTL`：验证码缓存时间，默认 5 分钟。
+- `ICLOUD_HME_RELOGIN_MANUAL_URL`：手动登录页地址，默认 Apple 隐私邮箱页。
+- `ICLOUD_HME_RELOGIN_PROTOCOL_TIMEOUT`：纯协议自动流程整体超时，默认 3 分钟。
+
+`.env` 示例：
+
+```dotenv
+ICLOUD_HME_RELOGIN_ENABLED=false
+ICLOUD_HME_RELOGIN_MODE=apple_protocol_sms
+ICLOUD_HME_RELOGIN_APPLE_ID=
+ICLOUD_HME_RELOGIN_APPLE_PASSWORD=
+ICLOUD_HME_RELOGIN_OTP_PROVIDER=smsgate_webhook
+ICLOUD_HME_RELOGIN_OTP_WEBHOOK_TOKEN=
+ICLOUD_HME_RELOGIN_OTP_TTL=5m
+ICLOUD_HME_RELOGIN_MANUAL_URL=https://account.apple.com/account/manage/section/privacy
+ICLOUD_HME_RELOGIN_PROTOCOL_TIMEOUT=3m
+```
+
+对应接口：
+
+- `POST /api/otp/inbound?token=...`
+- `GET /api/otp/latest?token=...&provider=apple`
+- `GET /api/relogin/config`
+
+关闭总开关时，页面仍然会弹窗提示你手动重新登录。
+
+管理页左侧新增 **配置** 菜单，会集中展示纯协议自动重新登录和 Android/SMSGate OTP 的当前状态；可直接在页面修改总开关、模式、Apple ID/密码、OTP provider/token/TTL、手动登录页，保存后写入 `.env` 并立即应用到当前服务进程。
+
+### Android SMSGate APK
+
+源码放在 `tools/android-sms-gateway/`，当前已自编译 debug APK：
+
+```text
+build/smsgateway-debug.apk
+```
+
+SHA256:
+
+```text
+AA3C7010191E64C12969D1F87A5C50CA59CA654E2236B88206F1061CBF4971AE
+```
+
+重新构建：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/build-smsgateway-apk.ps1
+```
+
+SMSGate 本地模式注册 webhook 示例：
+
+```bash
+curl -X POST "http://<安卓手机局域网IP>:8080/webhooks" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "icloud-hme-apple-otp",
+    "url": "http://<本机IP>:18081/api/otp/inbound?token=<ICLOUD_HME_RELOGIN_OTP_WEBHOOK_TOKEN>",
+    "event": "sms:received"
+  }'
+```
+
+服务端会二次过滤，只接受 Apple 相关短信中的 6 位验证码，并缓存验证码，不保存完整短信正文。
 
 ### 3. 启动服务
 
@@ -121,15 +212,15 @@ Cookie 是 iCloud 的临时会话凭据，不要发送给第三方；失效后�
 
 ### 核心接口
 
-#### 创建 HME 别名
+#### 获取 HME 别名（从本地池领取）
 
 ```bash
 POST /api/create
 
 # 请求体
 {
-  "account_id": "acc_1",      # 必填: 账号 ID
-  "label": "注册某网站"        # 可选: 别名标签
+  "account_id": "acc_1",      # 条件必填: 账号 ID
+  "caller": "chatgpt"         # 必填: 调用方身份，大小写视为同一身份
 }
 
 # 响应
@@ -137,8 +228,11 @@ POST /api/create
   "success": true,
   "data": {
     "email": "xyz123@icloud.com",
-    "label": "注册某网站",
+    "anonymousId": "abc123",
+    "caller": "chatgpt",
+    "used_by": ["chatgpt"],
     "created_at": "2024-01-15T10:30:00Z",
+    "protocol": "local_pool",
     "account_id": "acc_1"
   }
 }
@@ -170,7 +264,6 @@ GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&folder=all&limit=20&days
         "from": "noreply@example.com",
         "to": "xyz123@icloud.com",
         "subject": "欢迎注册",
-        "preview": "感谢您的注册...",
         "date": "2026-07-09T14:32:10+08:00"
       }
     ]
@@ -181,6 +274,14 @@ GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&folder=all&limit=20&days
 #   method: "imap"    — 通过 App Password 认证 (优先)
 #   method: "web_api" — 通过 Cookie 认证,无需 App Password (回退)
 ```
+
+邮件列表默认只返回信封摘要以加快加载速度。需要正文时再调用：
+
+```bash
+GET /api/inbox/message?account_id=acc_1&id=inbox:1042
+```
+
+HTML 邮件会返回 `html` 字段，管理页面通过 sandbox iframe 直接展示网页邮件内容。
 
 ### 账号管理接口
 
@@ -272,8 +373,12 @@ GET /api/aliases?account_id=acc_1
     "aliases": [
       {
         "email": "xyz123@icloud.com",
+        "anonymousId": "abc123",
         "label": "注册某网站",
-        "created_at": "2024-01-15T10:30:00Z"
+        "active": true,
+        "createdAt": "2024-01-15T10:30:00Z",
+        "used_by": ["chatgpt", "moxt"],
+        "used_by_count": 2
       }
     ]
   }
@@ -343,23 +448,27 @@ DELETE /api/aliases/:id
 
 ### 方式一: Cookie 认证 (推荐,功能最完整)
 
-Cookie 认证可实现所有功能:创建别名、读取邮件、管理别名。
+Cookie 认证用于后台创建别名、读取邮件回退和管理别名。
 
 **适用范围:**
-- 创建/停用/激活/删除 HME 别名 ✅
+- 后台创建/停用/激活/删除 HME 别名 ✅
 - 读取邮件 (通过 iCloud Web API,无需 App Password) ✅
 
 **获取 Cookie:**
 
-1. 使用浏览器登录 [icloud.com](https://www.icloud.com) 或 [icloud.com.cn](https://www.icloud.com.cn) (国区)
-2. 使用可信的 Cookie 导出工具导出 `icloud.com` / `www.icloud.com` 的全部 Cookie，或从 iCloud 请求的 `Cookie` 请求头复制完整内容
-3. 导出为 `{"key":"value"}` 对象、`[{"name":"key","value":"value"}]` 数组，或 `name=value; name2=value2` Header 格式
+1. 使用浏览器登录 [icloud.com](https://www.icloud.com) 或 [icloud.com.cn](https://www.icloud.com.cn) (国区)，并登录 [Apple 账户](https://account.apple.com/account/manage/section/privacy)
+2. 使用可信的 Cookie 导出工具同时导出 `icloud.com` / `www.icloud.com` 与 `account.apple.com` / `appleid.apple.com` 的全部 Cookie，优先使用带 `domain` 的数组格式
+3. 导出为 `{"key":"value"}` 对象、`[{"name":"key","value":"value","domain":".apple.com"}]` 数组，或 `name=value; name2=value2` Header 格式
 
 **关键 Cookie (必需):**
 - `X-APPLE-WEBAUTH-TOKEN` — 认证 token
 - `X-APPLE-WEBAUTH-USER` — 含 dsid (`v=1:s=1:d=22789132008`)
 - `X-APPLE-WEBAUTH-HSA-TRUST` — 设备信任 token
 - `X-APPLE-DS-WEB-SESSION-TOKEN` — 会话 token
+
+要使用后台别名池，导入的 Cookie 还应包含 Apple 账户会话中的 `myacinfo`、`caw`/`caw-at` 或 `awat`。检测到这些 Cookie 后，后台任务会调用 `appleid.apple.com/account/manage/email/private/add` 与 `/add/complete`；外部获取邮箱接口只从本地池领取。
+
+账户 Cookie 的有效期由 Apple 控制。`caw-at`/`awat` 是短期滚动值，不应单独当作长期凭据；建议保留已登录的账户页浏览器会话，空闲过期后从该页面重新导出 Cookie。
 
 **注意:** 导出的 Cookie 值不要包含多余的引号或转义字符。
 
@@ -418,9 +527,13 @@ icloud-hme/
 
 ## 常见问题
 
-### Q: 创建别名返回 401/403 错误?
+### Q: 后台别名池提示需要重新登录?
 
-**A:** Cookie 已过期，需要重新获取。iCloud Cookie 有效期通常为 24 小时。
+**A:** Apple 根登录态已过期。管理页面会提示重新登录并打开官方隐私邮箱页；登录完成后重新导出并更新 `icloud.com` 与 `account.apple.com` / `appleid.apple.com` Cookie。
+
+### Q: 调用方怎么避免拿到重复邮箱?
+
+**A:** 调用 `POST /api/create` 时传入 `caller`，例如 `chatgpt`。本项目会记录该调用方已领取过哪些别名；下次同一调用方再领取时会跳过这些邮箱。
 
 ### Q: 读取邮件返回超时?
 

@@ -136,6 +136,38 @@ func TestSaveCookiesCopiesInput(t *testing.T) {
 	}
 }
 
+func TestMergeRefreshedCookiesPreservesConcurrentChanges(t *testing.T) {
+	mgr, err := NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.accounts["acc_test"] = &Account{
+		ID: "acc_test",
+		Cookies: map[string]string{
+			"caw-at":     "old-token",
+			"concurrent": "newer-business-value",
+		},
+	}
+	before := map[string]string{
+		"caw-at":     "old-token",
+		"concurrent": "stale-snapshot",
+	}
+	refreshed := map[string]string{
+		"caw-at":     "rotated-token",
+		"concurrent": "stale-snapshot",
+	}
+	if err := mgr.mergeRefreshedCookies("acc_test", before, refreshed); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := mgr.GetAccount("acc_test")
+	if stored.Cookies["caw-at"] != "rotated-token" {
+		t.Fatal("rotated token was not merged")
+	}
+	if stored.Cookies["concurrent"] != "newer-business-value" {
+		t.Fatal("concurrent Cookie update was overwritten")
+	}
+}
+
 func TestSaveAliasStats(t *testing.T) {
 	mgr, err := NewManager(t.TempDir())
 	if err != nil {
@@ -160,6 +192,39 @@ func TestSaveAliasStats(t *testing.T) {
 	}
 	if account.Cookies["session"] != "rotated" {
 		t.Fatalf("cookies were not saved: %#v", account.Cookies)
+	}
+}
+
+func TestAcquireAliasIsCaseInsensitivePerCaller(t *testing.T) {
+	mgr, err := NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.accounts["acc_test"] = &Account{
+		ID: "acc_test",
+		AliasUsages: map[string]*AliasUsage{
+			"one@icloud.com": {Email: "one@icloud.com", Active: true, UsedBy: map[string]string{}},
+			"two@icloud.com": {Email: "two@icloud.com", Active: true, UsedBy: map[string]string{}},
+		},
+	}
+
+	first, err := mgr.AcquireAlias("acc_test", "ChatGPT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := mgr.AcquireAlias("acc_test", "chatgpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Email == second.Email {
+		t.Fatalf("same caller received duplicate alias: %s", first.Email)
+	}
+	other, err := mgr.AcquireAlias("acc_test", "MOXT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Email == "" {
+		t.Fatal("other caller did not receive an alias")
 	}
 }
 

@@ -5,13 +5,18 @@
 package mail
 
 import (
+	"bytes"
+	"encoding/base64"
 	"fmt"
+	stdhtml "html"
 	"io"
 	"mime"
+	"mime/multipart"
 	"mime/quotedprintable"
 	"net/mail"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,7 +66,9 @@ func NormalizeFolder(folder string) (string, error) {
 type FullMessage struct {
 	Message
 	Body        string `json:"body"`
+	HTML        string `json:"html,omitempty"`
 	ContentType string `json:"content_type"`
+	IsHTML      bool   `json:"is_html"`
 }
 
 // Client 是 iCloud 邮件 IMAP 客户端。
@@ -161,13 +168,10 @@ func (c *Client) listMailbox(mailbox, folder string, limit, days int) ([]Message
 	seqset := new(imap.SeqSet)
 	seqset.AddRange(from, mbox.Messages)
 
-	// 拉取完整正文,以便填充 Preview(OTP 验证码在正文中)
-	section := &imap.BodySectionName{}
 	items := []imap.FetchItem{
 		imap.FetchUid,
 		imap.FetchEnvelope,
 		imap.FetchInternalDate,
-		section.FetchItem(),
 	}
 
 	messages := make(chan *imap.Message, limit)
@@ -178,7 +182,7 @@ func (c *Client) listMailbox(mailbox, folder string, limit, days int) ([]Message
 
 	out := make([]Message, 0, limit)
 	for msg := range messages {
-		m := toMessageWithBody(msg)
+		m := toMessage(msg)
 		setMessageFolder(&m, folder)
 		if !messageWithinDays(m, days) {
 			continue
@@ -275,9 +279,7 @@ func (c *Client) fetchByUIDs(uids []uint32, limit int, folder string) ([]Message
 		seqset.AddNum(uid)
 	}
 
-	// 拉取完整正文,以便填充 Preview(OTP 验证码在正文中)
-	section := &imap.BodySectionName{}
-	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate, section.FetchItem()}
+	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate}
 	messages := make(chan *imap.Message, len(uids))
 	done := make(chan error, 1)
 	go func() {
@@ -286,7 +288,7 @@ func (c *Client) fetchByUIDs(uids []uint32, limit int, folder string) ([]Message
 
 	out := make([]Message, 0, len(uids))
 	for msg := range messages {
-		m := toMessageWithBody(msg)
+		m := toMessage(msg)
 		setMessageFolder(&m, folder)
 		out = append(out, m)
 	}
@@ -367,24 +369,42 @@ func messageTime(message Message) (time.Time, bool) {
 
 // GetFull 获取单封邮件的完整内容(含正文)。
 func (c *Client) GetFull(uid uint32) (*FullMessage, error) {
+	return c.GetFullByID(fmt.Sprintf("%s:%d", FolderInbox, uid))
+}
+
+// GetFullByID 按 list 接口返回的 id（folder:uid）读取单封邮件完整内容。
+func (c *Client) GetFullByID(messageID string) (*FullMessage, error) {
 	if c.cli == nil {
 		return nil, fmt.Errorf("未连接")
 	}
-	if _, err := c.cli.Select("INBOX", true); err != nil {
+	folder, uid, err := parseMessageID(messageID)
+	if err != nil {
+		return nil, err
+	}
+	mailbox, err := mailboxForFolder(folder)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := c.cli.Select(mailbox, true); err != nil {
 		return nil, err
 	}
 
 	seqset := new(imap.SeqSet)
 	seqset.AddNum(uid)
 
-	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate, imap.FetchRFC822}
+	section := &imap.BodySectionName{}
+	items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchInternalDate, section.FetchItem()}
 	messages := make(chan *imap.Message, 1)
 	done := make(chan error, 1)
 	go func() {
 		done <- c.cli.UidFetch(seqset, items, messages)
 	}()
 
-	msg := <-messages
+	var msg *imap.Message
+	for item := range messages {
+		msg = item
+		break
+	}
 	if err := <-done; err != nil {
 		return nil, err
 	}
@@ -393,12 +413,21 @@ func (c *Client) GetFull(uid uint32) (*FullMessage, error) {
 	}
 
 	full := &FullMessage{Message: toMessage(msg)}
+	setMessageFolder(&full.Message, folder)
 	// 解析正文
-	if r := msg.GetBody(&imap.BodySectionName{}); r != nil {
+	if r := msg.GetBody(section); r != nil {
 		if em, err := mail.ReadMessage(r); err == nil {
-			body, _ := readBody(em)
+			body, htmlBody, contentType, _ := readBodyParts(em)
 			full.Body = body
-			full.ContentType = em.Header.Get("Content-Type")
+			full.HTML = htmlBody
+			full.IsHTML = htmlBody != ""
+			full.ContentType = contentType
+			if full.Body == "" && full.HTML != "" {
+				full.Body = stripHTML(full.HTML)
+			}
+			if full.Preview == "" {
+				full.Preview = firstLine(full.Body)
+			}
 		}
 	}
 	return full, nil
@@ -464,28 +493,125 @@ func decodeHeader(s string) string {
 
 var htmlTag = regexp.MustCompile(`<[^>]+>`)
 
+func parseMessageID(messageID string) (string, uint32, error) {
+	messageID = strings.TrimSpace(messageID)
+	folder := FolderInbox
+	uidText := messageID
+	if index := strings.IndexByte(messageID, ':'); index > 0 {
+		folder = strings.ToLower(strings.TrimSpace(messageID[:index]))
+		uidText = messageID[index+1:]
+	}
+	uid, err := strconv.ParseUint(strings.TrimSpace(uidText), 10, 32)
+	if err != nil || uid == 0 {
+		return "", 0, fmt.Errorf("邮件 id 无效: %s", messageID)
+	}
+	if _, err := mailboxForFolder(folder); err != nil {
+		return "", 0, err
+	}
+	return folder, uint32(uid), nil
+}
+
 // readBody 读取邮件正文,优先 text/plain,其次从 HTML 提取纯文本。
 func readBody(msg *mail.Message) (string, error) {
-	ct := msg.Header.Get("Content-Type")
-	if strings.HasPrefix(ct, "text/html") {
-		raw, _ := io.ReadAll(msg.Body)
-		// quoted-printable 解码
-		if strings.Contains(msg.Header.Get("Content-Transfer-Encoding"), "quoted-printable") {
-			r := quotedprintable.NewReader(strings.NewReader(string(raw)))
-			raw, _ = io.ReadAll(r)
-		}
-		return stripHTML(string(raw)), nil
-	}
-	// 默认当 text/plain
-	raw, err := io.ReadAll(msg.Body)
+	plain, htmlBody, _, err := readBodyParts(msg)
 	if err != nil {
 		return "", err
 	}
-	if strings.Contains(msg.Header.Get("Content-Transfer-Encoding"), "quoted-printable") {
-		r := quotedprintable.NewReader(strings.NewReader(string(raw)))
-		raw, _ = io.ReadAll(r)
+	if strings.TrimSpace(plain) != "" {
+		return plain, nil
 	}
-	return string(raw), nil
+	return stripHTML(htmlBody), nil
+}
+
+// readBodyParts 解析 text/plain、text/html 以及 multipart/alternative 邮件。
+func readBodyParts(msg *mail.Message) (plain, htmlBody, contentType string, err error) {
+	if msg == nil {
+		return "", "", "", fmt.Errorf("邮件正文为空")
+	}
+	contentType = msg.Header.Get("Content-Type")
+	mediaType, params, parseErr := mime.ParseMediaType(contentType)
+	if parseErr != nil {
+		mediaType = strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+		params = nil
+	}
+	if strings.HasPrefix(mediaType, "multipart/") {
+		boundary := params["boundary"]
+		if boundary == "" {
+			raw, readErr := readTransferDecoded(msg.Body, msg.Header.Get("Content-Transfer-Encoding"))
+			return strings.TrimSpace(string(raw)), "", contentType, readErr
+		}
+		reader := multipart.NewReader(msg.Body, boundary)
+		for {
+			part, nextErr := reader.NextPart()
+			if nextErr == io.EOF {
+				break
+			}
+			if nextErr != nil {
+				return plain, htmlBody, contentType, nextErr
+			}
+			disposition := strings.ToLower(part.Header.Get("Content-Disposition"))
+			if strings.HasPrefix(disposition, "attachment") {
+				continue
+			}
+			nested := &mail.Message{Header: mail.Header(part.Header), Body: part}
+			partPlain, partHTML, _, partErr := readBodyParts(nested)
+			if partErr != nil {
+				continue
+			}
+			if strings.TrimSpace(plain) == "" && strings.TrimSpace(partPlain) != "" {
+				plain = strings.TrimSpace(partPlain)
+			}
+			if strings.TrimSpace(htmlBody) == "" && strings.TrimSpace(partHTML) != "" {
+				htmlBody = strings.TrimSpace(partHTML)
+			}
+		}
+		return plain, htmlBody, contentType, nil
+	}
+
+	raw, err := readTransferDecoded(msg.Body, msg.Header.Get("Content-Transfer-Encoding"))
+	if err != nil {
+		return "", "", contentType, err
+	}
+	if charsetName := strings.TrimSpace(params["charset"]); charsetName != "" {
+		if decodedReader, decodeErr := charset.Reader(charsetName, bytes.NewReader(raw)); decodeErr == nil {
+			if decoded, readErr := io.ReadAll(decodedReader); readErr == nil {
+				raw = decoded
+			}
+		}
+	}
+	text := string(raw)
+	switch strings.ToLower(mediaType) {
+	case "text/html", "application/xhtml+xml":
+		return "", text, contentType, nil
+	default:
+		return strings.TrimSpace(text), "", contentType, nil
+	}
+}
+
+func readTransferDecoded(body io.Reader, encoding string) ([]byte, error) {
+	encoding = strings.ToLower(strings.TrimSpace(encoding))
+	switch encoding {
+	case "quoted-printable":
+		return io.ReadAll(quotedprintable.NewReader(body))
+	case "base64":
+		return io.ReadAll(base64.NewDecoder(base64.StdEncoding, body))
+	default:
+		return io.ReadAll(body)
+	}
+}
+
+func firstLine(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if index := strings.IndexAny(value, "\r\n"); index >= 0 {
+		return value[:index]
+	}
+	if len(value) > 240 {
+		return value[:240]
+	}
+	return value
 }
 
 // stripHTML 粗略剥离 HTML 标签,保留可读文本。
@@ -501,10 +627,7 @@ func stripHTML(html string) string {
 	// 去掉所有标签
 	html = htmlTag.ReplaceAllString(html, "")
 	// 反转义常见实体
-	html = strings.ReplaceAll(html, "&nbsp;", " ")
-	html = strings.ReplaceAll(html, "&amp;", "&")
-	html = strings.ReplaceAll(html, "&lt;", "<")
-	html = strings.ReplaceAll(html, "&gt;", ">")
+	html = strings.ReplaceAll(stdhtml.UnescapeString(html), "\u00a0", " ")
 	// 压缩多余空白
 	lines := strings.Split(html, "\n")
 	for i, l := range lines {

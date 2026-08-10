@@ -9,21 +9,26 @@
     accounts: [],
     aliases: [],
     messages: [],
+    messageDetails: {},
+    reloginConfig: { enabled: false, manual_login_url: "https://account.apple.com/account/manage/section/privacy", otp: {} },
     inboxError: "",
     selectedAccountId: localStorage.getItem("icloud-hme.selected-account") || "",
     selectedMessageId: "",
+    inboxRequestSeq: 0,
     inboxFolder: "all",
     aliasFilter: "all",
     aliasSearch: "",
     aliasesLoadedFor: "",
     modalSubmit: null,
     confirmSubmit: null,
+    loginPrompted: {},
   };
 
   const viewMeta = {
     accounts: { title: "账号" },
     aliases: { title: "别名" },
     inbox: { title: "收件箱" },
+    settings: { title: "配置" },
   };
 
   function renderIcons(root = document) {
@@ -46,15 +51,24 @@
 
   function formatDate(value, fallback = "-") {
     if (!value) return fallback;
-    const parsed = new Date(value);
+    let parsed;
+    if (typeof value === "number" || /^\d+$/.test(String(value))) {
+      const numeric = Number(value);
+      parsed = new Date(numeric > 1_000_000_000_000 ? numeric : numeric * 1000);
+    } else {
+      parsed = new Date(value);
+    }
     if (Number.isNaN(parsed.getTime())) return String(value);
     return new Intl.DateTimeFormat("zh-CN", {
+      timeZone: "Asia/Shanghai",
+      year: "numeric",
       month: "2-digit",
       day: "2-digit",
       hour: "2-digit",
       minute: "2-digit",
+      second: "2-digit",
       hour12: false,
-    }).format(parsed);
+    }).format(parsed).replaceAll("/", "-") + " 北京时间";
   }
 
   function folderLabel(folder) {
@@ -230,6 +244,7 @@
       renderAccountSelect();
       renderAccounts();
       renderInboxAliasOptions();
+      maybePromptRelogin();
     } catch (error) {
       setServiceStatus(false);
       if (!silent) {
@@ -242,13 +257,202 @@
     }
   }
 
+  async function refreshReloginConfig() {
+    try {
+      state.reloginConfig = await request("/api/relogin/config");
+    } catch {
+      state.reloginConfig = { enabled: false, manual_login_url: "https://account.apple.com/account/manage/section/privacy", otp: {} };
+    }
+    renderReloginConfig();
+  }
+
+  function formatDurationSeconds(seconds) {
+    const value = Number(seconds || 0);
+    if (!value) return "-";
+    if (value % 60 === 0) return `${value / 60} 分钟`;
+    return `${value} 秒`;
+  }
+
+  function formatDurationSecondsForInput(seconds, fallback) {
+    const value = Number(seconds || 0);
+    if (!value) return fallback;
+    if (value % 3600 === 0) return `${value / 3600}h`;
+    if (value % 60 === 0) return `${value / 60}m`;
+    return `${value}s`;
+  }
+
+  function configStatusBadge(enabled, yesText = "已配置", noText = "未配置") {
+    return `<span class="status-badge ${enabled ? "status-active" : "status-inactive"}">${enabled ? yesText : noText}</span>`;
+  }
+
+  function reloginEnvTemplate() {
+    return [
+      "# 纯协议自动重新登录 + Android/SMSGate 验证码接收",
+      "# 总开关关闭时，登录态过期仍走页面弹窗手动重新登录",
+      "ICLOUD_HME_RELOGIN_ENABLED=false",
+      "ICLOUD_HME_RELOGIN_MODE=apple_protocol_sms",
+      "ICLOUD_HME_RELOGIN_APPLE_ID=",
+      "ICLOUD_HME_RELOGIN_APPLE_PASSWORD=",
+      "ICLOUD_HME_RELOGIN_OTP_PROVIDER=smsgate_webhook",
+      "ICLOUD_HME_RELOGIN_OTP_WEBHOOK_TOKEN=",
+      "ICLOUD_HME_RELOGIN_OTP_TTL=5m",
+      "ICLOUD_HME_RELOGIN_MANUAL_URL=https://account.apple.com/account/manage/section/privacy",
+      "ICLOUD_HME_RELOGIN_PROTOCOL_TIMEOUT=3m",
+    ].join("\n");
+  }
+
+  function configRow(label, value) {
+    return `<div class="config-row"><dt>${escapeHTML(label)}</dt><dd>${value}</dd></div>`;
+  }
+
+  function renderReloginConfig() {
+    const panel = $("#relogin-config-panel");
+    if (!panel) return;
+    const cfg = state.reloginConfig || {};
+    const otp = cfg.otp || {};
+    const ready = Boolean(cfg.enabled && cfg.apple_id_configured && cfg.apple_password_configured && otp.webhook_enabled);
+    const manualURL = cfg.manual_login_url || "https://account.apple.com/account/manage/section/privacy";
+    const webhookURL = `${window.location.origin}${otp.webhook_path || "/api/otp/inbound"}?token=<TOKEN>`;
+    const latestURL = `${window.location.origin}${otp.latest_path || "/api/otp/latest"}?token=<TOKEN>&provider=apple`;
+    const enabledChecked = cfg.enabled ? "checked" : "";
+    const behavior = cfg.enabled
+      ? (ready ? "纯协议自动流程已启用，OTP 由 webhook 接收。" : "纯协议自动流程已开启，但还有配置项待补齐。")
+      : "总开关关闭，登录态过期时页面会弹窗并打开手动登录页。";
+
+    const summary = $("#settings-summary");
+    if (summary) {
+      summary.textContent = cfg.enabled
+        ? `自动重新登录：${ready ? "配置完整" : "待补齐"}`
+        : "自动重新登录关闭，使用手动登录弹窗";
+    }
+
+    panel.innerHTML = `
+      <article class="config-card">
+        <header>
+          <span class="metric-icon ${cfg.enabled ? "tone-green" : "tone-amber"}"><i data-lucide="${cfg.enabled ? "shield-check" : "shield-alert"}"></i></span>
+          <div>
+            <h3>纯协议自动重新登录</h3>
+            <p>${escapeHTML(behavior)}</p>
+          </div>
+        </header>
+        <dl class="config-list">
+          ${configRow("总开关", configStatusBadge(Boolean(cfg.enabled), "已开启", "已关闭"))}
+          ${configRow("模式", `<code>${escapeHTML(cfg.mode || "apple_protocol_sms")}</code>`)}
+          ${configRow("Apple ID", configStatusBadge(Boolean(cfg.apple_id_configured)))}
+          ${configRow("Apple 密码", configStatusBadge(Boolean(cfg.apple_password_configured)))}
+          ${configRow("协议超时", `<span>${escapeHTML(formatDurationSeconds(cfg.protocol_timeout_seconds))}</span>`)}
+          ${configRow("手动登录页", `<a href="${escapeHTML(manualURL)}" target="_blank" rel="noopener">${escapeHTML(manualURL)}</a>`)}
+        </dl>
+        <div class="config-actions">
+          <button class="button button-secondary" type="button" data-action="open-manual-login">
+            <i data-lucide="external-link"></i><span>打开手动登录页</span>
+          </button>
+        </div>
+      </article>
+
+      <article class="config-card">
+        <header>
+          <span class="metric-icon ${otp.webhook_enabled ? "tone-green" : "tone-amber"}"><i data-lucide="message-square-lock"></i></span>
+          <div>
+            <h3>Android/SMSGate OTP</h3>
+            <p>只缓存 Apple 短信里的 6 位验证码，不保存完整短信正文。</p>
+          </div>
+        </header>
+        <dl class="config-list">
+          ${configRow("Provider", `<code>${escapeHTML(otp.provider || "smsgate_webhook")}</code>`)}
+          ${configRow("Webhook Token", configStatusBadge(Boolean(otp.webhook_enabled)))}
+          ${configRow("兼容旧 Token", configStatusBadge(Boolean(otp.legacy_token_configured), "已检测", "未使用"))}
+          ${configRow("验证码 TTL", `<span>${escapeHTML(formatDurationSeconds(otp.ttl_seconds))}</span>`)}
+          ${configRow("接收地址", `<code>${escapeHTML(webhookURL)}</code>`)}
+          ${configRow("读取地址", `<code>${escapeHTML(latestURL)}</code>`)}
+        </dl>
+      </article>
+
+      <article class="config-card config-card-wide">
+        <header>
+          <span class="metric-icon tone-teal"><i data-lucide="sliders-horizontal"></i></span>
+          <div>
+            <h3>页面配置</h3>
+            <p>保存后会写入项目根目录 .env 并立即应用到当前进程；密码和 token 留空表示保持现有值。</p>
+          </div>
+        </header>
+        <form class="config-form" id="relogin-config-form">
+          <label class="field switch-field">
+            <span>启用纯协议自动重新登录</span>
+            <input name="enabled" type="checkbox" ${enabledChecked}>
+          </label>
+          <div class="field-row">
+            <label class="field"><span>模式</span><input name="mode" value="${escapeHTML(cfg.mode || "apple_protocol_sms")}" autocomplete="off"></label>
+            <label class="field"><span>协议超时</span><input name="protocol_timeout" value="${escapeHTML(formatDurationSecondsForInput(cfg.protocol_timeout_seconds, "3m"))}" autocomplete="off" placeholder="3m"></label>
+          </div>
+          <div class="field-row">
+            <label class="field"><span>Apple ID</span><input name="apple_id" autocomplete="username" placeholder="${cfg.apple_id_configured ? "已配置，留空保持现有值" : "name@example.com"}"></label>
+            <label class="field"><span>Apple 密码</span><input name="apple_password" type="password" autocomplete="new-password" placeholder="${cfg.apple_password_configured ? "已配置，留空保持现有值" : "输入后保存到 .env"}"></label>
+          </div>
+          <div class="field-row">
+            <label class="field"><span>OTP Provider</span><input name="otp_provider" value="${escapeHTML(otp.provider || "smsgate_webhook")}" autocomplete="off"></label>
+            <label class="field"><span>OTP TTL</span><input name="otp_ttl" value="${escapeHTML(formatDurationSecondsForInput(otp.ttl_seconds, "5m"))}" autocomplete="off" placeholder="5m"></label>
+          </div>
+          <label class="field"><span>OTP Webhook Token</span><input name="otp_webhook_token" type="password" autocomplete="new-password" placeholder="${otp.webhook_enabled ? "已配置，留空保持现有值" : "建议使用随机长 token"}"></label>
+          <label class="field"><span>手动登录页</span><input name="manual_login_url" value="${escapeHTML(manualURL)}" autocomplete="off"></label>
+          <div class="config-actions">
+            <button class="button button-primary" type="submit" id="relogin-config-submit">
+              <i data-lucide="save"></i><span>保存到 .env 并应用</span>
+            </button>
+          </div>
+        </form>
+      </article>
+
+      <article class="config-card config-card-wide">
+        <header>
+          <span class="metric-icon tone-teal"><i data-lucide="file-code-2"></i></span>
+          <div>
+            <h3>.env 配置模板</h3>
+            <p>也可以复制模板后手动编辑 .env；服务启动时会读取这一组配置。</p>
+          </div>
+        </header>
+        <pre class="env-block">${escapeHTML(reloginEnvTemplate())}</pre>
+      </article>
+    `;
+    renderIcons(panel);
+  }
+
+  function maybePromptRelogin() {
+    state.accounts.forEach((item) => {
+      if (!item.requires_login) delete state.loginPrompted[item.id];
+    });
+    const account = currentAccount() || state.accounts.find((item) => item.requires_login);
+    if (!account || !account.requires_login || state.loginPrompted[account.id]) return;
+    const dialog = $("#confirm-dialog");
+    if (dialog?.open) return;
+    state.loginPrompted[account.id] = true;
+    if (state.reloginConfig?.enabled) {
+      const otpReady = Boolean(state.reloginConfig?.otp?.webhook_enabled);
+      const credentialsReady = Boolean(state.reloginConfig?.apple_id_configured && state.reloginConfig?.apple_password_configured);
+      if (otpReady && credentialsReady) {
+        toast(`${account.name || account.id} 登录态过期，已启用纯协议自动重新登录，等待 Apple 短信验证码。`);
+      } else {
+        toast(`已开启纯协议自动重新登录，但配置未完整：Apple 账号密码=${credentialsReady ? "已配置" : "未配置"}，OTP webhook=${otpReady ? "已配置" : "未配置"}`, "error");
+      }
+      return;
+    }
+    openConfirm({
+      title: "需要重新登录 Apple",
+      message: `${account.name || account.id} 的 Apple 账户登录态已过期。点击确定后会打开官方隐私邮箱页面，登录完成后请回到本页面更新 Cookie。`,
+      submitLabel: "打开登录页",
+      onSubmit: async () => {
+        window.open(state.reloginConfig?.manual_login_url || "https://account.apple.com/account/manage/section/privacy", "icloud_hme_relogin", "popup,width=1120,height=820");
+      },
+    });
+  }
+
   function filteredAliases() {
     const search = state.aliasSearch.trim().toLowerCase();
     return state.aliases.filter((alias) => {
       const statusMatch = state.aliasFilter === "all"
         || (state.aliasFilter === "active" && alias.active)
         || (state.aliasFilter === "inactive" && !alias.active);
-      const searchMatch = !search || `${alias.email || ""} ${alias.label || ""}`.toLowerCase().includes(search);
+      const searchMatch = !search || `${alias.email || ""} ${(alias.used_by || []).join(" ")}`.toLowerCase().includes(search);
       return statusMatch && searchMatch;
     });
   }
@@ -277,8 +481,8 @@
             <button class="copy-button" type="button" data-action="copy-email" data-email="${escapeHTML(alias.email)}" title="复制邮箱" aria-label="复制邮箱"><i data-lucide="copy"></i></button>
           </div>
         </td>
-        <td data-label="标签"><span>${escapeHTML(alias.label || "-")}</span></td>
         <td data-label="状态"><span class="status-badge ${alias.active ? "status-active" : "status-inactive"}">${alias.active ? "使用中" : "已停用"}</span></td>
+        <td data-label="调用方使用记录"><span class="cell-secondary">${escapeHTML((alias.used_by || []).join("、") || "尚未领取")}</span></td>
         <td data-label="创建时间"><span class="cell-secondary">${escapeHTML(formatDate(alias.createdAt))}</span></td>
         <td data-label="操作" class="align-right">
           <div class="row-actions">
@@ -334,6 +538,9 @@
       renderAliases();
       renderInboxAliasOptions();
       toast(error.message, "error");
+      if (error.status === 401) {
+        await refreshAccounts({ silent: true });
+      }
     }
   }
 
@@ -356,6 +563,9 @@
       return;
     }
 
+    const htmlBody = message.html ? `
+          <iframe class="mail-html-frame" sandbox srcdoc="${escapeHTML(message.html)}"></iframe>` : "";
+    const textBody = !message.html ? `<div class="mail-content">${escapeHTML(message.body || message.preview || "无正文内容")}</div>` : "";
     detail.innerHTML = `
       <div class="mail-detail-content">
         <button class="icon-button mail-detail-close" type="button" data-action="close-message" title="返回邮件列表" aria-label="返回邮件列表"><i data-lucide="arrow-left"></i></button>
@@ -369,9 +579,16 @@
             <dt>ID</dt><dd>${escapeHTML(message.id || "-")}</dd>
           </dl>
         </header>
-        <div class="mail-content">${escapeHTML(message.preview || "无预览内容")}</div>
+        ${htmlBody || textBody}
       </div>`;
     detail.classList.add("is-open");
+    renderIcons(detail);
+  }
+
+  function renderMailDetailLoading() {
+    const detail = $("#mail-detail");
+    detail.classList.add("is-open");
+    detail.innerHTML = `<div class="loading-state"><i data-lucide="loader-circle"></i><span>加载邮件正文</span></div>`;
     renderIcons(detail);
   }
 
@@ -393,17 +610,12 @@
       return;
     }
 
-    if (!state.messages.some((message) => message.id === state.selectedMessageId)) {
-      state.selectedMessageId = state.messages[0].id;
-    }
     list.innerHTML = state.messages.map((message) => `
       <button class="mail-item${message.id === state.selectedMessageId ? " is-selected" : ""}" type="button" data-action="select-message" data-id="${escapeHTML(message.id)}">
         <span class="mail-item-head"><strong>${escapeHTML(message.from || "未知发件人")}</strong><span class="mail-item-meta"><span class="mail-folder-badge${message.folder === "junk" ? " is-junk" : ""}">${escapeHTML(folderLabel(message.folder || "inbox"))}</span><time>${escapeHTML(formatDate(message.date))}</time></span></span>
         <span class="mail-subject">${escapeHTML(message.subject || "无主题")}</span>
-        <span class="mail-preview">${escapeHTML(message.preview || "无预览内容")}</span>
       </button>`).join("");
-    const selected = state.messages.find((message) => message.id === state.selectedMessageId);
-    renderMailDetail(selected);
+    if (!state.selectedMessageId) renderMailDetail(null);
   }
 
   function renderMessagesLoading() {
@@ -422,6 +634,8 @@
     }
     state.inboxError = "";
     renderMessagesLoading();
+    const requestSeq = ++state.inboxRequestSeq;
+    const requestAccountId = account.id;
     const params = new URLSearchParams({
       account_id: account.id,
       folder: state.inboxFolder,
@@ -432,15 +646,50 @@
     if (alias) params.set("alias", alias);
     try {
       const data = await request(`/api/inbox?${params}`);
+      if (requestSeq !== state.inboxRequestSeq || state.selectedAccountId !== requestAccountId) return;
       state.messages = data?.messages || [];
       state.inboxError = "";
-      state.selectedMessageId = state.messages[0]?.id || "";
+      state.selectedMessageId = "";
+      state.messageDetails = {};
       renderMessages();
       $("#inbox-summary").textContent = `${account.name || account.id} · ${folderLabel(data?.folder || state.inboxFolder)} · ${state.messages.length} 封邮件 · ${data?.method === "imap" ? "IMAP" : "Web API"}`;
     } catch (error) {
+      if (requestSeq !== state.inboxRequestSeq || state.selectedAccountId !== requestAccountId) return;
       state.messages = [];
       state.inboxError = error.message;
       renderMessages();
+    }
+  }
+
+  async function loadMessageDetail(messageId) {
+    const account = currentAccount();
+    if (!account || !messageId) return;
+    state.selectedMessageId = messageId;
+    renderMessages();
+    if (state.messageDetails[messageId]) {
+      renderMailDetail(state.messageDetails[messageId]);
+      return;
+    }
+    renderMailDetailLoading();
+    const requestAccountId = account.id;
+    const params = new URLSearchParams({ account_id: account.id, id: messageId });
+    try {
+      const data = await request(`/api/inbox/message?${params}`);
+      if (state.selectedAccountId !== requestAccountId || state.selectedMessageId !== messageId) return;
+      const message = data?.message || {};
+      state.messageDetails[messageId] = message;
+      renderMailDetail(message);
+    } catch (error) {
+      if (state.selectedAccountId !== requestAccountId || state.selectedMessageId !== messageId) return;
+      renderMailDetail({
+        id: messageId,
+        subject: "正文加载失败",
+        from: "-",
+        to: "-",
+        date: "",
+        folder: messageId.split(":")[0] || "inbox",
+        body: error.message,
+      });
     }
   }
 
@@ -450,6 +699,7 @@
       if (state.view === "accounts") await refreshAccounts({ silent: true });
       if (state.view === "aliases") await refreshAliases({ force: true });
       if (state.view === "inbox") await refreshInbox();
+      if (state.view === "settings") await refreshReloginConfig();
     } finally {
       setRefreshLoading(false);
     }
@@ -473,9 +723,10 @@
 
     if (view === "aliases") await refreshAliases();
     if (view === "inbox") {
-      await refreshAliases();
+      void refreshAliases();
       await refreshInbox();
     }
+    if (view === "settings") await refreshReloginConfig();
   }
 
   function editorError(message = "") {
@@ -531,7 +782,7 @@
           <label class="field"><span>iCloud 区域</span><select name="host"><option value="icloud.com">icloud.com</option><option value="icloud.com.cn">icloud.com.cn</option></select></label>
         </div>
         <label class="field"><span>代理地址</span><input name="proxy" placeholder="http://user:pass@host:port" autocomplete="off"></label>
-        <label class="field"><span>Cookie</span><textarea name="cookies" required placeholder="JSON、浏览器导出数组或 Cookie Header" spellcheck="false"></textarea><small>请先在浏览器登录 iCloud，再导出 icloud.com 的 Cookie；账号创建时会立即校验。</small></label>`,
+        <label class="field"><span>Cookie</span><textarea name="cookies" required placeholder="JSON、浏览器导出数组或 Cookie Header" spellcheck="false"></textarea><small>请导入 icloud.com 及 account.apple.com / appleid.apple.com 的登录 Cookie；包含 Apple 账户 Cookie 时，创建别名会使用与官网一致的账户管理接口。</small></label>`,
       onSubmit: async (form) => {
         const data = new FormData(form);
         const cookies = String(data.get("cookies") || "").trim();
@@ -579,7 +830,7 @@
       eyebrow: account.name || "账号",
       title: "更新 Cookie",
       submitLabel: "验证并保存",
-      body: `<label class="field"><span>Cookie</span><textarea name="cookies" required placeholder="JSON、浏览器导出数组或 Cookie Header" spellcheck="false"></textarea></label>`,
+      body: `<label class="field"><span>Cookie</span><textarea name="cookies" required placeholder="JSON、浏览器导出数组或 Cookie Header" spellcheck="false"></textarea><small>同时导入 icloud.com 与 account.apple.com / appleid.apple.com Cookie，可启用官网创建协议。</small></label>`,
       onSubmit: async (form) => {
         const cookies = parseCookieInput(String(new FormData(form).get("cookies") || ""));
         await request(`/api/accounts/${encodeURIComponent(account.id)}/cookies`, {
@@ -624,25 +875,28 @@
     if (!account) return toast("请先选择账号", "error");
     openEditor({
       eyebrow: account.name || "账号",
-      title: "创建邮箱别名",
-      submitLabel: "创建别名",
-      body: `<label class="field"><span>标签</span><input name="label" maxlength="120" autocomplete="off" placeholder="可选"></label>`,
+      title: "领取池中别名",
+      submitLabel: "领取别名",
+      body: `
+        <label class="field"><span>调用方身份</span><input name="caller" maxlength="80" autocomplete="off" placeholder="例如 chatgpt、moxt" required></label>
+        <p class="field-help">这里从后台定时创建的本地别名池领取邮箱，不触发 Apple 创建请求；同一调用方不会重复拿到已领取过的邮箱。</p>`,
       onSubmit: async (form) => {
-        const label = String(new FormData(form).get("label") || "").trim();
+        const data = new FormData(form);
+        const caller = String(data.get("caller") || "").trim();
         const result = await request("/api/create", {
           method: "POST",
-          body: JSON.stringify({ account_id: account.id, label }),
+          body: JSON.stringify({ account_id: account.id, caller }),
         });
         closeEditor();
         state.aliasesLoadedFor = "";
         await refreshAliases({ force: true });
         await refreshAccounts({ silent: true });
-        toast(`已创建 ${result.email}`);
+        toast(`已领取 ${result.email}`);
       },
     });
   }
 
-  async function copyText(value) {
+  async function copyText(value, message = "已复制") {
     try {
       await navigator.clipboard.writeText(value);
     } catch {
@@ -655,7 +909,42 @@
       document.execCommand("copy");
       textarea.remove();
     }
-    toast("邮箱已复制");
+    toast(message);
+  }
+
+  async function saveReloginConfig(form) {
+    const data = new FormData(form);
+    const otp = {
+      provider: String(data.get("otp_provider") || "smsgate_webhook").trim(),
+      ttl: String(data.get("otp_ttl") || "5m").trim(),
+    };
+    const otpToken = String(data.get("otp_webhook_token") || "").trim();
+    if (otpToken) otp.webhook_token = otpToken;
+
+    const body = {
+      enabled: data.get("enabled") === "on",
+      mode: String(data.get("mode") || "apple_protocol_sms").trim(),
+      manual_login_url: String(data.get("manual_login_url") || "").trim(),
+      protocol_timeout: String(data.get("protocol_timeout") || "3m").trim(),
+      otp,
+    };
+    const appleID = String(data.get("apple_id") || "").trim();
+    const applePassword = String(data.get("apple_password") || "").trim();
+    if (appleID) body.apple_id = appleID;
+    if (applePassword) body.apple_password = applePassword;
+
+    const submit = $("#relogin-config-submit", form);
+    setButtonLoading(submit, true);
+    try {
+      state.reloginConfig = await request("/api/relogin/config", {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      renderReloginConfig();
+      toast("重新登录配置已保存并应用");
+    } finally {
+      setButtonLoading(submit, false);
+    }
   }
 
   async function toggleAlias(button) {
@@ -708,6 +997,7 @@
         await request(`/api/accounts/${encodeURIComponent(account.id)}`, { method: "DELETE" });
         state.aliases = [];
         state.messages = [];
+        state.messageDetails = {};
         state.inboxError = "";
         state.aliasesLoadedFor = "";
         await refreshAccounts({ silent: true });
@@ -724,7 +1014,9 @@
     localStorage.setItem("icloud-hme.selected-account", id);
     state.aliases = [];
     state.messages = [];
+    state.messageDetails = {};
     state.inboxError = "";
+    state.inboxRequestSeq++;
     state.aliasesLoadedFor = "";
     state.selectedMessageId = "";
     renderInboxAliasOptions();
@@ -767,7 +1059,7 @@
       if (action === "set-password") openPasswordEditor(account);
       if (action === "delete-account") deleteAccount(account);
       if (action === "create-alias") openCreateAlias();
-      if (action === "copy-email") copyText(button.dataset.email || "");
+      if (action === "copy-email") copyText(button.dataset.email || "", "邮箱已复制");
       if (action === "toggle-alias") toggleAlias(button);
       if (action === "delete-alias") deleteAlias(button);
       if (action === "close-message") $("#mail-detail").classList.remove("is-open");
@@ -777,8 +1069,24 @@
         await setView("aliases");
       }
       if (action === "select-message") {
-        state.selectedMessageId = button.dataset.id;
-        renderMessages();
+        await loadMessageDetail(button.dataset.id);
+      }
+      if (action === "open-manual-login") {
+        window.open(state.reloginConfig?.manual_login_url || "https://account.apple.com/account/manage/section/privacy", "icloud_hme_relogin", "popup,width=1120,height=820");
+      }
+      if (action === "refresh-relogin-config") {
+        setButtonLoading(button, true);
+        try {
+          await refreshReloginConfig();
+          toast("重新登录配置已刷新");
+        } catch (error) {
+          toast(error.message, "error");
+        } finally {
+          setButtonLoading(button, false);
+        }
+      }
+      if (action === "copy-relogin-env") {
+        await copyText(reloginEnvTemplate(), ".env 模板已复制");
       }
       if (action === "reload-config") {
         setButtonLoading(button, true);
@@ -799,7 +1107,8 @@
       selectAccount(event.target.value);
       if (state.view === "aliases") await refreshAliases({ force: true });
       if (state.view === "inbox") {
-        await refreshAliases({ force: true });
+        renderMessages();
+        void refreshAliases({ force: true });
         await refreshInbox();
       }
     });
@@ -814,6 +1123,16 @@
     $("#inbox-filter-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       await refreshInbox();
+    });
+
+    document.addEventListener("submit", async (event) => {
+      if (event.target?.id !== "relogin-config-form") return;
+      event.preventDefault();
+      try {
+        await saveReloginConfig(event.target);
+      } catch (error) {
+        toast(error.message, "error");
+      }
     });
 
     $("#editor-form").addEventListener("submit", async (event) => {
@@ -863,8 +1182,10 @@
     bindEvents();
     renderMessages();
     try {
+      await refreshReloginConfig();
       await refreshAccounts();
       void refreshAliases({ force: true });
+      window.setInterval(() => refreshAccounts({ silent: true }).catch(() => {}), 60_000);
     } catch {
       // The offline state and toast are handled by refreshAccounts.
     }

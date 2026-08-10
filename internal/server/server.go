@@ -2,7 +2,7 @@
 //
 // 两个核心接口:
 //
-//	POST /api/create  — 在指定账号下创建一个 Hide My Email 别名
+//	POST /api/create  — 从本地别名池领取一个 Hide My Email 别名
 //	GET  /api/inbox   — 读取指定账号(或指定别名)收到的邮件
 //
 // 辅助接口(用于多账号管理):账号增删查、别名列表、设置 App 密码。
@@ -11,7 +11,6 @@ package server
 import (
 	"crypto/subtle"
 	"errors"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -25,7 +24,7 @@ import (
 )
 
 const (
-	defaultCreateMinInterval     = 30 * time.Second
+	defaultCreateMinInterval     = 0
 	defaultCreateFailureCooldown = 10 * time.Minute
 )
 
@@ -44,6 +43,9 @@ type Server struct {
 	now                   func() time.Time
 	createMinInterval     time.Duration
 	createFailureCooldown time.Duration
+	relogin               ReloginConfig
+	otpMu                 sync.Mutex
+	otpCodes              []otpCodeRecord
 }
 
 // New 创建 Server。debug 为 true 时启用 Gin 调试日志。
@@ -62,6 +64,7 @@ func New(mgr *account.Manager, debug bool, apiKeys ...string) *Server {
 		now:                   time.Now,
 		createMinInterval:     defaultCreateMinInterval,
 		createFailureCooldown: defaultCreateFailureCooldown,
+		relogin:               ReloginConfigFromEnv(),
 	}
 	s.r = gin.Default() // 自带 Logger + Recovery 中间件
 	s.register()
@@ -94,6 +97,7 @@ func (s *Server) register() {
 
 		// ===== 核心接口 2: 读取邮件 =====
 		api.GET("/inbox", s.listInbox)
+		api.GET("/inbox/message", s.getInboxMessage)
 
 		// ===== 别名管理 =====
 		api.GET("/aliases", s.listAliases)
@@ -103,6 +107,10 @@ func (s *Server) register() {
 
 		// ===== 系统 =====
 		api.POST("/reload", s.reloadConfig)
+		api.POST("/otp/inbound", s.receiveOTP)
+		api.GET("/otp/latest", s.latestOTP)
+		api.GET("/relogin/config", s.reloginConfig)
+		api.PUT("/relogin/config", s.updateReloginConfig)
 	}
 }
 
@@ -151,15 +159,19 @@ func failCreate(c *gin.Context, code int, msg string, httpErr *hme.HTTPError, re
 }
 
 // ====================================================================
-// 核心接口 1: 创建邮箱
+// 核心接口 1: 获取邮箱
 //   POST /api/create
-//   body: {"account_id": "acc_xxx", "label": "可选标签"}
-//   返回: 新创建的 HME 邮箱地址
+//   body: {"account_id": "acc_xxx", "caller": "chatgpt"}
+//   返回: 本地别名池中尚未被该 caller 领取过的 HME 邮箱地址
 // ====================================================================
 
 type createReq struct {
 	AccountID string `json:"account_id"`
+	Caller    string `json:"caller"`
+	Client    string `json:"client"`
+	Identity  string `json:"identity"`
 	Label     string `json:"label"`
+	Note      string `json:"note"`
 }
 
 func (s *Server) createAlias(c *gin.Context) {
@@ -175,42 +187,54 @@ func (s *Server) createAlias(c *gin.Context) {
 	}
 	req.AccountID = accountID
 
-	client, err := s.mgr.HMEClient(req.AccountID, false)
-	if err != nil {
-		fail(c, http.StatusNotFound, err.Error())
+	caller := account.NormalizeCaller(firstNonEmptyString(req.Caller, req.Client, req.Identity))
+	if caller == "" {
+		fail(c, http.StatusBadRequest, "参数缺失: caller（调用方身份字符串，例如 chatgpt、moxt）")
 		return
 	}
 
-	if retryAfter, allowed := s.beginCreate(req.AccountID); !allowed {
-		failCreate(c, http.StatusTooManyRequests, "该账号的创建请求正在执行或处于冷却期，请稍后重试", nil, retryAfter)
-		return
-	}
-	failureCooldown := time.Duration(0)
-	defer func() { s.finishCreate(req.AccountID, failureCooldown) }()
-
-	result, err := client.CreateAlias(req.Label, 1)
-
-	// 操作完成后,保存可能已刷新的 Cookie（validate 会轮换 token）
-	_ = s.mgr.SaveCookies(req.AccountID, client.Cookies)
-
+	alias, err := s.mgr.AcquireAlias(req.AccountID, caller)
 	if err != nil {
-		code, message, httpErr, cooldown := s.classifyCreateError(err)
-		failureCooldown = cooldown
-		if httpErr != nil {
-			log.Printf("iCloud 创建别名失败 account_id=%s upstream_status=%d upstream_body=%q", req.AccountID, httpErr.StatusCode, httpErr.Body)
-		} else {
-			log.Printf("iCloud 创建别名失败 account_id=%s error=%q", req.AccountID, err.Error())
+		// 本地池没有可领别名时，先同步一次 Apple 侧列表，避免刚启动时本地记录为空。
+		if syncErr := s.syncAliases(req.AccountID); syncErr != nil {
+			if isSessionError(syncErr.Error()) {
+				s.mgr.MarkLoginRequired(req.AccountID, syncErr)
+				fail(c, http.StatusUnauthorized, "Apple 登录态已过期，请在管理页面重新登录并更新 Cookie: "+syncErr.Error())
+				return
+			}
+			fail(c, http.StatusConflict, err.Error()+"；同步 Apple 别名列表失败: "+syncErr.Error())
+			return
 		}
-		failCreate(c, code, message, httpErr, cooldown)
-		return
+		alias, err = s.mgr.AcquireAlias(req.AccountID, caller)
+		if err != nil {
+			fail(c, http.StatusConflict, err.Error())
+			return
+		}
 	}
 
 	ok(c, gin.H{
-		"email":      result.Email,
-		"label":      result.Label,
-		"created_at": result.CreatedAt,
-		"account_id": req.AccountID,
+		"email":       alias.Email,
+		"anonymousId": alias.AnonymousID,
+		"label":       alias.Label,
+		"created_at":  alias.CreatedAt,
+		"caller":      caller,
+		"used_by":     alias.UsedBy,
+		"protocol":    "local_pool",
+		"account_id":  req.AccountID,
 	})
+}
+
+func (s *Server) syncAliases(accountID string) error {
+	client, err := s.mgr.HMEClient(accountID, false)
+	if err != nil {
+		return err
+	}
+	aliases, err := client.ListAliases()
+	if err != nil {
+		_ = s.mgr.SaveCookies(accountID, client.Cookies)
+		return err
+	}
+	return s.mgr.SaveAliasStats(accountID, aliases, client.Cookies)
 }
 
 func (s *Server) resolveCreateAccountID(accountID string) (string, int, error) {
@@ -271,6 +295,11 @@ func (s *Server) finishCreate(accountID string, failureCooldown time.Duration) {
 func (s *Server) classifyCreateError(err error) (int, string, *hme.HTTPError, time.Duration) {
 	var httpErr *hme.HTTPError
 	if errors.As(err, &httpErr) {
+		body := strings.ToLower(httpErr.Body)
+		if strings.Contains(body, "rate_limit_exceeded") || strings.Contains(body, "too many") {
+			cooldown := maxDuration(s.createFailureCooldown, httpErr.RetryAfter)
+			return http.StatusTooManyRequests, "Apple 暂时限制了自动创建，请在冷却结束后重试: " + err.Error(), httpErr, cooldown
+		}
 		switch httpErr.StatusCode {
 		case http.StatusUnauthorized, http.StatusForbidden:
 			return http.StatusUnauthorized, "iCloud 会话失效，请更新 Cookie: " + err.Error(), httpErr, 0
@@ -299,6 +328,15 @@ func maxDuration(left, right time.Duration) time.Duration {
 		return right
 	}
 	return left
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // ====================================================================
@@ -406,6 +444,56 @@ func (s *Server) listInbox(c *gin.Context) {
 			"method":     "web_api",
 		})
 	}
+}
+
+func (s *Server) getInboxMessage(c *gin.Context) {
+	accountID := c.Query("account_id")
+	messageID := strings.TrimSpace(c.Query("id"))
+	if accountID == "" {
+		fail(c, http.StatusBadRequest, "参数缺失: account_id")
+		return
+	}
+	if messageID == "" {
+		fail(c, http.StatusBadRequest, "参数缺失: id")
+		return
+	}
+
+	var imapErr error
+	mc, err := s.mgr.MailClient(accountID)
+	if err == nil {
+		if connErr := mc.Connect(); connErr == nil {
+			defer mc.Disconnect()
+			full, err := mc.GetFullByID(messageID)
+			if err == nil {
+				ok(c, gin.H{
+					"account_id": accountID,
+					"message":    full,
+					"method":     "imap",
+				})
+				return
+			}
+			imapErr = err
+		} else {
+			imapErr = connErr
+		}
+	} else {
+		imapErr = err
+	}
+
+	wmc, webErr := s.mgr.WebMailClient(accountID)
+	if webErr == nil {
+		full, err := wmc.GetFull(messageID)
+		if err == nil {
+			ok(c, gin.H{
+				"account_id": accountID,
+				"message":    full,
+				"method":     "web_api",
+			})
+			return
+		}
+		webErr = err
+	}
+	fail(c, http.StatusFailedDependency, inboxClientError(imapErr, webErr))
 }
 
 func setMessagesFolder(messages []mail.Message, folder string) {
@@ -525,6 +613,7 @@ func (s *Server) listAliases(c *gin.Context) {
 	if err != nil {
 		_ = s.mgr.SaveCookies(accountID, client.Cookies)
 		if isSessionError(err.Error()) {
+			s.mgr.MarkLoginRequired(accountID, err)
 			fail(c, http.StatusUnauthorized, "iCloud 会话失效,请更新 Cookie: "+err.Error())
 		} else {
 			fail(c, http.StatusBadGateway, err.Error())
@@ -535,6 +624,7 @@ func (s *Server) listAliases(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, "保存别名统计失败: "+err.Error())
 		return
 	}
+	aliases = s.mgr.DecorateAliases(accountID, aliases)
 	ok(c, gin.H{
 		"account_id": accountID,
 		"count":      len(aliases),

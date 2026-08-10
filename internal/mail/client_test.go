@@ -1,6 +1,8 @@
 package mail
 
 import (
+	"net/mail"
+	"strings"
 	"testing"
 	"time"
 )
@@ -52,5 +54,23 @@ func TestMessageWithinDaysParsesRFC3339(t *testing.T) {
 	}
 	if messageWithinDays(old, 1) {
 		t.Fatal("old RFC3339 message was not filtered out")
+	}
+}
+
+func TestReadBodyPartsKeepsHTMLBody(t *testing.T) {
+	raw := "Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<html><body><p>Hello&nbsp;<b>World</b></p></body></html>"
+	msg, err := mail.ReadMessage(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, htmlBody, _, err := readBodyParts(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain != "" || !strings.Contains(htmlBody, "<b>World</b>") {
+		t.Fatalf("plain=%q html=%q", plain, htmlBody)
+	}
+	if got := stripHTML(htmlBody); !strings.Contains(got, "Hello World") {
+		t.Fatalf("stripped html = %q", got)
 	}
 }

@@ -52,6 +52,118 @@ func TestAPIKeyAuthEndpoint(t *testing.T) {
 	}
 }
 
+func TestReloginConfigEndpointDefaultsToManual(t *testing.T) {
+	t.Setenv("ICLOUD_HME_RELOGIN_ENABLED", "")
+	t.Setenv("ICLOUD_HME_RELOGIN_OTP_WEBHOOK_TOKEN", "")
+	t.Setenv("ICLOUD_HME_OTP_WEBHOOK_TOKEN", "")
+	mgr, err := account.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(mgr, false)
+	req := httptest.NewRequest(http.MethodGet, "/api/relogin/config", nil)
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", res.Code)
+	}
+	body := res.Body.String()
+	if !strings.Contains(body, `"enabled":false`) || !strings.Contains(body, `"manual_login_url"`) {
+		t.Fatalf("unexpected config response: %s", body)
+	}
+}
+
+func TestReloginConfigEndpointReadsUnifiedOTPSettings(t *testing.T) {
+	t.Setenv("ICLOUD_HME_RELOGIN_ENABLED", "1")
+	t.Setenv("ICLOUD_HME_RELOGIN_OTP_WEBHOOK_TOKEN", "secret")
+	t.Setenv("ICLOUD_HME_RELOGIN_OTP_TTL", "7m")
+	t.Setenv("ICLOUD_HME_RELOGIN_APPLE_ID", "user@example.com")
+	t.Setenv("ICLOUD_HME_RELOGIN_APPLE_PASSWORD", "password")
+	mgr, err := account.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(mgr, false)
+	req := httptest.NewRequest(http.MethodGet, "/api/relogin/config", nil)
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", res.Code)
+	}
+	body := res.Body.String()
+	for _, want := range []string{`"enabled":true`, `"webhook_enabled":true`, `"ttl_seconds":420`, `"apple_id_configured":true`, `"apple_password_configured":true`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("response %s does not contain %s", body, want)
+		}
+	}
+	if strings.Contains(body, "secret") || strings.Contains(body, "user@example.com") || strings.Contains(body, `"password"`) {
+		t.Fatalf("response leaked relogin secrets: %s", body)
+	}
+}
+
+func TestUpdateReloginConfigEndpointPersistsDotEnv(t *testing.T) {
+	envFile := t.TempDir() + "/.env"
+	t.Setenv("ICLOUD_HME_ENV_FILE", envFile)
+	t.Setenv("ICLOUD_HME_RELOGIN_ENABLED", "")
+	t.Setenv("ICLOUD_HME_RELOGIN_OTP_WEBHOOK_TOKEN", "")
+	t.Setenv("ICLOUD_HME_RELOGIN_APPLE_ID", "")
+	t.Setenv("ICLOUD_HME_RELOGIN_APPLE_PASSWORD", "")
+	t.Setenv("ICLOUD_HME_OTP_WEBHOOK_TOKEN", "")
+	mgr, err := account.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(mgr, false)
+
+	body := `{
+		"enabled": true,
+		"mode": "apple_protocol_sms",
+		"manual_login_url": "https://account.apple.com/account/manage/section/privacy",
+		"protocol_timeout": "4m",
+		"apple_id": "user@example.com",
+		"apple_password": "secret-password",
+		"otp": {
+			"provider": "smsgate_webhook",
+			"webhook_token": "webhook-secret",
+			"ttl": "6m"
+		}
+	}`
+	req := httptest.NewRequest(http.MethodPut, "/api/relogin/config", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	responseBody := res.Body.String()
+	for _, leaked := range []string{"secret-password", "webhook-secret", "user@example.com"} {
+		if strings.Contains(responseBody, leaked) {
+			t.Fatalf("response leaked secret/config value %q: %s", leaked, responseBody)
+		}
+	}
+	for _, want := range []string{`"enabled":true`, `"apple_id_configured":true`, `"apple_password_configured":true`, `"webhook_enabled":true`, `"ttl_seconds":360`} {
+		if !strings.Contains(responseBody, want) {
+			t.Fatalf("response %s does not contain %s", responseBody, want)
+		}
+	}
+	raw, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envText := string(raw)
+	for _, want := range []string{
+		"ICLOUD_HME_RELOGIN_ENABLED=true",
+		"ICLOUD_HME_RELOGIN_APPLE_ID=user@example.com",
+		"ICLOUD_HME_RELOGIN_APPLE_PASSWORD=secret-password",
+		"ICLOUD_HME_RELOGIN_OTP_WEBHOOK_TOKEN=webhook-secret",
+		"ICLOUD_HME_RELOGIN_OTP_TTL=6m0s",
+	} {
+		if !strings.Contains(envText, want) {
+			t.Fatalf(".env %q does not contain %s", envText, want)
+		}
+	}
+}
+
 func TestWebConsoleAndAPI(t *testing.T) {
 	mgr, err := account.NewManager(t.TempDir())
 	if err != nil {
@@ -120,29 +232,24 @@ func TestAccountsEndpointRedactsCredentials(t *testing.T) {
 	}
 }
 
-func TestCreateGateSerializesAndAppliesCooldown(t *testing.T) {
+func TestCreateGateSerializesAndAppliesFailureCooldown(t *testing.T) {
 	now := time.Date(2026, time.August, 5, 0, 0, 0, 0, time.UTC)
 	srv := &Server{
 		createAttempts:        make(map[string]*createAttemptState),
 		now:                   func() time.Time { return now },
-		createMinInterval:     30 * time.Second,
+		createMinInterval:     0,
 		createFailureCooldown: 10 * time.Minute,
 	}
 
 	if _, allowed := srv.beginCreate("acc_test"); !allowed {
 		t.Fatal("first create attempt was rejected")
 	}
-	if retry, allowed := srv.beginCreate("acc_test"); allowed || retry != 30*time.Second {
+	if retry, allowed := srv.beginCreate("acc_test"); allowed || retry != time.Second {
 		t.Fatalf("concurrent attempt allowed=%v retry=%s", allowed, retry)
 	}
 	srv.finishCreate("acc_test", 0)
-	if retry, allowed := srv.beginCreate("acc_test"); allowed || retry != 30*time.Second {
-		t.Fatalf("minimum interval allowed=%v retry=%s", allowed, retry)
-	}
-
-	now = now.Add(31 * time.Second)
 	if _, allowed := srv.beginCreate("acc_test"); !allowed {
-		t.Fatal("attempt after minimum interval was rejected")
+		t.Fatal("attempt after successful completion was rejected")
 	}
 	srv.finishCreate("acc_test", 10*time.Minute)
 	if retry, allowed := srv.beginCreate("acc_test"); allowed || retry != 10*time.Minute {
@@ -173,6 +280,12 @@ func TestClassifyCreateErrorPreservesUpstreamStatus(t *testing.T) {
 	if code != http.StatusUnauthorized || cooldown != 0 {
 		t.Fatalf("401 mapping = code %d cooldown %s", code, cooldown)
 	}
+
+	upstream = &hme.HTTPError{StatusCode: http.StatusPreconditionFailed, Body: `{"ineligibilityReason":"rate_limit_exceeded"}`}
+	code, _, gotHTTPError, cooldown = srv.classifyCreateError(fmt.Errorf("account add: %w", upstream))
+	if code != http.StatusTooManyRequests || gotHTTPError != upstream || cooldown != 10*time.Minute {
+		t.Fatalf("412 rate limit mapping = code %d cooldown %s error %#v", code, cooldown, gotHTTPError)
+	}
 }
 
 func TestAddAccountRequiresCookies(t *testing.T) {
@@ -187,6 +300,24 @@ func TestAddAccountRequiresCookies(t *testing.T) {
 	srv.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", res.Code)
+	}
+}
+
+func TestCreateEndpointRequiresCaller(t *testing.T) {
+	mgr, err := account.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(mgr, false)
+	req := httptest.NewRequest(http.MethodPost, "/api/create", bytes.NewBufferString(`{"account_id":"acc_test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", res.Code)
+	}
+	if !strings.Contains(res.Body.String(), "caller") {
+		t.Fatalf("response does not mention caller: %s", res.Body.String())
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,21 +21,37 @@ import (
 
 // Account 描述一个 iCloud 账号。
 type Account struct {
-	ID            string            `json:"id"`
-	Name          string            `json:"name"`
-	RealEmail     string            `json:"real_email"`
-	ICloudEmail   string            `json:"icloud_email"`
-	Cookies       map[string]string `json:"cookies"`
-	Host          string            `json:"host"`
-	Proxy         string            `json:"proxy,omitempty"` // HTTP/SOCKS5 代理
-	AppPassword   string            `json:"app_password,omitempty"`
-	HMEClientID   string            `json:"hme_client_id,omitempty"`
-	Status        string            `json:"status"` // active / error
-	AliasTotal    int               `json:"alias_total"`
-	AliasActive   int               `json:"alias_active"`
-	LastValidated string            `json:"last_validated"`
-	LastError     string            `json:"last_error,omitempty"`
-	CreatedAt     string            `json:"created_at"`
+	ID            string                 `json:"id"`
+	Name          string                 `json:"name"`
+	RealEmail     string                 `json:"real_email"`
+	ICloudEmail   string                 `json:"icloud_email"`
+	Cookies       map[string]string      `json:"cookies"`
+	Host          string                 `json:"host"`
+	Proxy         string                 `json:"proxy,omitempty"` // HTTP/SOCKS5 代理
+	AppPassword   string                 `json:"app_password,omitempty"`
+	HMEClientID   string                 `json:"hme_client_id,omitempty"`
+	Status        string                 `json:"status"` // active / error
+	AliasTotal    int                    `json:"alias_total"`
+	AliasActive   int                    `json:"alias_active"`
+	AliasUsages   map[string]*AliasUsage `json:"alias_usages,omitempty"`
+	RequiresLogin bool                   `json:"requires_login,omitempty"`
+	LastValidated string                 `json:"last_validated"`
+	LastError     string                 `json:"last_error,omitempty"`
+	CreatedAt     string                 `json:"created_at"`
+}
+
+// AliasUsage 是本项目对某个 HME 别名的本地使用记录。
+//
+// Apple 只维护别名本身；调用方身份与“是否领取过”的关系由本项目保存。
+type AliasUsage struct {
+	Email       string            `json:"email"`
+	AnonymousID string            `json:"anonymous_id,omitempty"`
+	Label       string            `json:"label,omitempty"`
+	Active      bool              `json:"active"`
+	CreatedAt   string            `json:"created_at,omitempty"`
+	CreatedBy   string            `json:"created_by,omitempty"`
+	LastSeenAt  string            `json:"last_seen_at,omitempty"`
+	UsedBy      map[string]string `json:"used_by,omitempty"`
 }
 
 // Manager 管理多个 iCloud 账号,线程安全。
@@ -43,6 +60,12 @@ type Manager struct {
 	accounts map[string]*Account
 	dataDir  string
 	dataFile string
+}
+
+// SessionRefreshResult 描述一个 Apple 账户管理会话的保活结果。
+type SessionRefreshResult struct {
+	AccountID string
+	Err       error
 }
 
 // NewManager 创建管理器。dataDir 用于存放 accounts.json。
@@ -213,11 +236,13 @@ func (m *Manager) AddAccount(name, cookieInput, host, proxy string) (*Account, e
 		if err != nil {
 			return nil, err
 		}
-		if err := client.ValidateSession(); err != nil {
+		if err := validateHMESession(client); err != nil {
 			acc.Status = "error"
+			acc.RequiresLogin = true
 			acc.LastError = truncate(err.Error(), 300)
 		} else {
 			acc.Status = "active"
+			acc.RequiresLogin = false
 			if info := client.AccountInfo(); info != nil {
 				acc.RealEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail)
 				acc.ICloudEmail = deriveICloudEmail(info)
@@ -266,6 +291,7 @@ func (m *Manager) GetAccount(id string) (*Account, bool) {
 	}
 	cp := *acc
 	cp.Cookies = cloneStringMap(acc.Cookies)
+	cp.AliasUsages = cloneAliasUsageMap(acc.AliasUsages)
 	return &cp, true
 }
 
@@ -279,6 +305,7 @@ func (m *Manager) ListAccounts() []*Account {
 		cp.Cookies = nil
 		cp.AppPassword = ""
 		cp.HMEClientID = ""
+		cp.AliasUsages = nil
 		out = append(out, &cp)
 	}
 	return out
@@ -415,6 +442,125 @@ func (m *Manager) SaveCookies(id string, cookies map[string]string) error {
 	return m.save()
 }
 
+// MarkLoginRequired 标记账号需要重新登录。前端会据此弹窗并打开 Apple 登录页。
+func (m *Manager) MarkLoginRequired(id string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return
+	}
+	acc.Status = "error"
+	acc.RequiresLogin = true
+	if err != nil {
+		acc.LastError = truncate(err.Error(), 300)
+	} else {
+		acc.LastError = "Apple 登录态已过期"
+	}
+	_ = m.save()
+}
+
+// RegisterCreatedAlias 保存后台定时创建出来的别名到本地池。
+func (m *Manager) RegisterCreatedAlias(id string, created *hme.CreateResult, cookies map[string]string) error {
+	if created == nil || strings.TrimSpace(created.Email) == "" {
+		return nil
+	}
+	alias := hme.Alias{
+		Email:       strings.ToLower(strings.TrimSpace(created.Email)),
+		AnonymousID: created.AnonymousID,
+		Label:       created.Label,
+		Active:      true,
+		CreatedAt:   created.CreatedAt,
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	if cookies != nil {
+		acc.Cookies = cloneStringMap(cookies)
+	}
+	ensureAliasUsageLocked(acc, alias, "auto_pool")
+	acc.AliasTotal = countAliasUsages(acc, false)
+	acc.AliasActive = countAliasUsages(acc, true)
+	acc.Status = "active"
+	acc.RequiresLogin = false
+	acc.LastError = ""
+	return m.save()
+}
+
+// RefreshAccountSessions 刷新所有使用 Apple 账户管理协议的会话。
+// 保存时只合并本次请求实际发生变化的 Cookie,避免覆盖并发业务请求的新值。
+func (m *Manager) RefreshAccountSessions() []SessionRefreshResult {
+	type candidate struct {
+		id       string
+		cookies  map[string]string
+		host     string
+		proxy    string
+		clientID string
+	}
+
+	m.mu.Lock()
+	candidates := make([]candidate, 0, len(m.accounts))
+	for id, acc := range m.accounts {
+		if len(acc.Cookies) == 0 {
+			continue
+		}
+		candidates = append(candidates, candidate{
+			id:       id,
+			cookies:  cloneStringMap(acc.Cookies),
+			host:     acc.Host,
+			proxy:    acc.Proxy,
+			clientID: acc.HMEClientID,
+		})
+	}
+	m.mu.Unlock()
+
+	results := make([]SessionRefreshResult, 0, len(candidates))
+	for _, item := range candidates {
+		client, err := hme.NewClientWithID(item.cookies, item.host, item.proxy, item.clientID, false)
+		if err != nil {
+			results = append(results, SessionRefreshResult{AccountID: item.id, Err: err})
+			continue
+		}
+		if !client.UsesAccountAPI() {
+			continue
+		}
+		if err := client.ValidateAccountSession(); err != nil {
+			m.MarkLoginRequired(item.id, err)
+			results = append(results, SessionRefreshResult{AccountID: item.id, Err: err})
+			continue
+		}
+		err = m.mergeRefreshedCookies(item.id, item.cookies, client.Cookies)
+		results = append(results, SessionRefreshResult{AccountID: item.id, Err: err})
+	}
+	return results
+}
+
+func (m *Manager) mergeRefreshedCookies(id string, before, refreshed map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	if acc.Cookies == nil {
+		acc.Cookies = make(map[string]string)
+	}
+	for name, value := range refreshed {
+		if value == "" || before[name] == value {
+			continue
+		}
+		acc.Cookies[name] = value
+	}
+	acc.Status = "active"
+	acc.RequiresLogin = false
+	acc.LastError = ""
+	acc.LastValidated = time.Now().Format(time.RFC3339)
+	return m.save()
+}
+
 // SaveAliasStats 保存指定账号的 Cookie 和最新别名统计。
 // 别名列表是 iCloud 的事实来源，账号列表中的汇总字段由此同步。
 func (m *Manager) SaveAliasStats(id string, aliases []hme.Alias, cookies map[string]string) error {
@@ -427,14 +573,99 @@ func (m *Manager) SaveAliasStats(id string, aliases []hme.Alias, cookies map[str
 	if cookies != nil {
 		acc.Cookies = cloneStringMap(cookies)
 	}
+	for _, usage := range acc.AliasUsages {
+		if usage != nil {
+			usage.Active = false
+		}
+	}
 	acc.AliasTotal = len(aliases)
 	acc.AliasActive = 0
 	for _, alias := range aliases {
 		if alias.Active {
 			acc.AliasActive++
 		}
+		ensureAliasUsageLocked(acc, alias, "icloud_sync")
 	}
+	acc.Status = "active"
+	acc.RequiresLogin = false
+	acc.LastError = ""
 	return m.save()
+}
+
+// DecorateAliases 把本地调用方使用记录附加到别名列表，供管理页面展示。
+func (m *Manager) DecorateAliases(id string, aliases []hme.Alias) []hme.Alias {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok || len(aliases) == 0 {
+		return aliases
+	}
+	out := make([]hme.Alias, len(aliases))
+	copy(out, aliases)
+	for i := range out {
+		key := aliasKey(out[i].Email)
+		usage := acc.AliasUsages[key]
+		if usage == nil {
+			continue
+		}
+		out[i].UsedBy = sortedUsageCallers(usage.UsedBy)
+		out[i].UsedByCount = len(out[i].UsedBy)
+		out[i].LastUsedAt = latestUsageAt(usage.UsedBy)
+	}
+	return out
+}
+
+// AcquireAlias 为某个调用方从本地别名池领取一个尚未被该调用方领取过的别名。
+func (m *Manager) AcquireAlias(id, caller string) (*hme.Alias, error) {
+	caller = NormalizeCaller(caller)
+	if caller == "" {
+		return nil, fmt.Errorf("调用方身份 caller 必填")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return nil, fmt.Errorf("账号不存在: %s", id)
+	}
+	if len(acc.AliasUsages) == 0 {
+		return nil, fmt.Errorf("当前账号本地别名池为空，请等待后台定时创建或先刷新别名列表")
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	var selected *AliasUsage
+	for _, usage := range acc.AliasUsages {
+		if usage == nil || !usage.Active || usage.Email == "" {
+			continue
+		}
+		if _, used := usage.UsedBy[caller]; used {
+			continue
+		}
+		if selected == nil || betterAliasCandidate(usage, selected) {
+			selected = usage
+		}
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("该调用方暂无可领取的新别名，请等待后台定时创建")
+	}
+	if selected.UsedBy == nil {
+		selected.UsedBy = make(map[string]string)
+	}
+	selected.UsedBy[caller] = now
+	if err := m.save(); err != nil {
+		return nil, err
+	}
+	alias := hme.Alias{
+		Email:       selected.Email,
+		AnonymousID: selected.AnonymousID,
+		Label:       selected.Label,
+		Active:      selected.Active,
+		CreatedAt:   selected.CreatedAt,
+		UsedBy:      sortedUsageCallers(selected.UsedBy),
+		UsedByCount: len(selected.UsedBy),
+		LastUsedAt:  latestUsageAt(selected.UsedBy),
+	}
+	return &alias, nil
 }
 
 // UpdateCookies 更新指定账号的 Cookie,并自动校验会话有效性。
@@ -469,6 +700,7 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 		}
 		acc.Cookies = cloneStringMap(cookies)
 		acc.Status = "error"
+		acc.RequiresLogin = true
 		acc.LastError = "创建客户端失败: " + err.Error()
 		m.accounts[id] = acc
 		_ = m.save()
@@ -482,7 +714,7 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 	var realEmail, icloudEmail string
 	var aliases []hme.Alias
 	aliasesLoaded := false
-	if err := client.ValidateSession(); err != nil {
+	if err := validateHMESession(client); err != nil {
 		status = "error"
 		lastError = "Cookie 校验失败: " + err.Error()
 	} else {
@@ -506,6 +738,7 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 	acc.Status = status
 	acc.LastError = lastError
 	if status == "active" {
+		acc.RequiresLogin = false
 		acc.LastValidated = lastValidated
 		if realEmail != "" {
 			acc.RealEmail = realEmail
@@ -514,19 +747,42 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 			acc.ICloudEmail = icloudEmail
 		}
 	}
+	if status == "error" {
+		acc.RequiresLogin = true
+	}
 	if aliasesLoaded {
+		for _, usage := range acc.AliasUsages {
+			if usage != nil {
+				usage.Active = false
+			}
+		}
 		acc.AliasTotal = len(aliases)
 		acc.AliasActive = 0
 		for _, alias := range aliases {
 			if alias.Active {
 				acc.AliasActive++
 			}
+			ensureAliasUsageLocked(acc, alias, "icloud_sync")
 		}
 	}
 	m.accounts[id] = acc
 	saveErr := m.save()
 	m.mu.Unlock()
 	return saveErr
+}
+
+func validateHMESession(client *hme.Client) error {
+	legacyErr := client.ValidateSession()
+	if legacyErr == nil {
+		return nil
+	}
+	if !client.UsesAccountAPI() {
+		return legacyErr
+	}
+	if accountErr := client.ValidateAccountSession(); accountErr != nil {
+		return fmt.Errorf("iCloud Web 校验失败: %v; Apple 账户校验失败: %w", legacyErr, accountErr)
+	}
+	return nil
 }
 
 // ---- 辅助函数 ----
@@ -587,6 +843,147 @@ func ensureHMEClientID(acc *Account) bool {
 	return true
 }
 
+// NormalizeCaller 规范化调用方身份，大小写视为同一个调用方。
+func NormalizeCaller(caller string) string {
+	return strings.ToLower(strings.TrimSpace(caller))
+}
+
+func aliasKey(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+func ensureAliasUsageLocked(acc *Account, alias hme.Alias, source string) *AliasUsage {
+	if acc.AliasUsages == nil {
+		acc.AliasUsages = make(map[string]*AliasUsage)
+	}
+	key := aliasKey(alias.Email)
+	if key == "" {
+		return nil
+	}
+	now := time.Now().Format(time.RFC3339)
+	usage := acc.AliasUsages[key]
+	if usage == nil {
+		usage = &AliasUsage{
+			Email:      key,
+			Active:     alias.Active,
+			CreatedAt:  alias.CreatedAt,
+			CreatedBy:  source,
+			LastSeenAt: now,
+			UsedBy:     make(map[string]string),
+		}
+		acc.AliasUsages[key] = usage
+	}
+	usage.Email = key
+	if alias.AnonymousID != "" {
+		usage.AnonymousID = alias.AnonymousID
+	}
+	if alias.Label != "" {
+		usage.Label = alias.Label
+	}
+	usage.Active = alias.Active
+	if alias.CreatedAt != "" {
+		usage.CreatedAt = alias.CreatedAt
+	}
+	if usage.CreatedBy == "" {
+		usage.CreatedBy = source
+	}
+	usage.LastSeenAt = now
+	if usage.UsedBy == nil {
+		usage.UsedBy = make(map[string]string)
+	}
+	return usage
+}
+
+func countAliasUsages(acc *Account, activeOnly bool) int {
+	if acc == nil {
+		return 0
+	}
+	count := 0
+	for _, usage := range acc.AliasUsages {
+		if usage == nil || usage.Email == "" {
+			continue
+		}
+		if activeOnly && !usage.Active {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func betterAliasCandidate(candidate, current *AliasUsage) bool {
+	candidateUsed := len(candidate.UsedBy)
+	currentUsed := len(current.UsedBy)
+	if candidateUsed != currentUsed {
+		return candidateUsed < currentUsed
+	}
+	candidateTime, candidateOK := parseAnyTime(candidate.CreatedAt)
+	currentTime, currentOK := parseAnyTime(current.CreatedAt)
+	if candidateOK && currentOK && !candidateTime.Equal(currentTime) {
+		return candidateTime.Before(currentTime)
+	}
+	if candidateOK != currentOK {
+		return candidateOK
+	}
+	return candidate.Email < current.Email
+}
+
+func sortedUsageCallers(used map[string]string) []string {
+	if len(used) == 0 {
+		return nil
+	}
+	callers := make([]string, 0, len(used))
+	for caller := range used {
+		callers = append(callers, caller)
+	}
+	sort.Strings(callers)
+	return callers
+}
+
+func latestUsageAt(used map[string]string) string {
+	var latest string
+	var latestTime time.Time
+	for _, value := range used {
+		parsed, ok := parseAnyTime(value)
+		if ok {
+			if latest == "" || parsed.After(latestTime) {
+				latest = value
+				latestTime = parsed
+			}
+			continue
+		}
+		if value > latest {
+			latest = value
+		}
+	}
+	return latest
+}
+
+func parseAnyTime(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05", "2006-01-02 15:04"} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed, true
+		}
+	}
+	if ms, err := parseInt64(value); err == nil && ms > 0 {
+		if ms > 1_000_000_000_000 {
+			return time.UnixMilli(ms), true
+		}
+		return time.Unix(ms, 0), true
+	}
+	return time.Time{}, false
+}
+
+func parseInt64(value string) (int64, error) {
+	var n int64
+	_, err := fmt.Sscanf(value, "%d", &n)
+	return n, err
+}
+
 func cloneStringMap(values map[string]string) map[string]string {
 	if values == nil {
 		return nil
@@ -594,6 +991,22 @@ func cloneStringMap(values map[string]string) map[string]string {
 	cloned := make(map[string]string, len(values))
 	for key, value := range values {
 		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneAliasUsageMap(values map[string]*AliasUsage) map[string]*AliasUsage {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]*AliasUsage, len(values))
+	for key, value := range values {
+		if value == nil {
+			continue
+		}
+		cp := *value
+		cp.UsedBy = cloneStringMap(value.UsedBy)
+		cloned[key] = &cp
 	}
 	return cloned
 }

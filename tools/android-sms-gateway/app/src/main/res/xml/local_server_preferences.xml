@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+    <PreferenceCategory app:title="@string/server">
+        <EditTextPreference
+            app:defaultValue="8080"
+            app:icon="@drawable/ic_server"
+            app:key="localserver.PORT"
+            app:title="@string/port"
+            app:useSimpleSummaryProvider="true" />
+    </PreferenceCategory>
+    <PreferenceCategory app:title="@string/credentials">
+        <EditTextPreference
+            app:enableCopying="true"
+            app:icon="@drawable/ic_username"
+            app:key="localserver.USERNAME"
+            app:title="@string/username"
+            app:defaultValue="@string/sms"
+            app:useSimpleSummaryProvider="true" />
+        <EditTextPreference
+            app:enableCopying="true"
+            app:icon="@drawable/ic_password"
+            app:key="localserver.PASSWORD"
+            app:title="@string/password"
+            app:useSimpleSummaryProvider="true" />
+    </PreferenceCategory>
+    <PreferenceCategory app:title="@string/jwt">
+        <EditTextPreference
+            app:icon="@drawable/ic_timer"
+            app:key="localserver.JWT_TTL_SECONDS"
+            app:title="@string/jwt_default_ttl_seconds"
+            app:defaultValue="86400"
+            app:useSimpleSummaryProvider="true" />
+        <Preference
+            android:icon="@drawable/ic_advanced"
+            android:key="transient.jwt_regenerate_secret"
+            android:title="@string/jwt_regenerate_secret"
+            android:summary="@string/jwt_regenerate_secret_summary"
+            android:persistent="false" />
+    </PreferenceCategory>
+
+    <PreferenceCategory app:title="@string/device">
+        <Preference
+            android:icon="@drawable/ic_device_id"
+            android:key="transient.device_id"
+            android:title="@string/device_id"
+            app:enableCopying="true"
+            android:persistent="false" />
+    </PreferenceCategory>
+    <Preference app:summary="@string/restart_required_to_apply_changes" />
+</PreferenceScreen>

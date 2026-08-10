@@ -270,6 +270,15 @@ func (c *WebClient) FindByAlias(alias string, limit int) ([]Message, error) {
 	return filtered, nil
 }
 
+// GetFull 读取 Web API 邮件详情。当前 Web 端搜索接口只返回摘要；
+// 正文详情优先使用 IMAP App Password 获取。
+func (c *WebClient) GetFull(threadID string) (*FullMessage, error) {
+	if strings.TrimSpace(threadID) == "" {
+		return nil, fmt.Errorf("邮件 id 为空")
+	}
+	return nil, fmt.Errorf("Web API 正文详情需要 IMAP App Password")
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

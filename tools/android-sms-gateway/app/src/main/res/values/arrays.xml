@@ -1,0 +1,56 @@
+<resources>
+    <string-array name="limit_periods_titles">
+        <item>disabled</item>
+        <item>minute</item>
+        <item>30 minutes</item>
+        <item>hour</item>
+        <item>day</item>
+    </string-array>
+    <string-array name="limit_periods_values">
+        <item>Disabled</item>
+        <item>PerMinute</item>
+        <item>Per30Minutes</item>
+        <item>PerHour</item>
+        <item>PerDay</item>
+    </string-array>
+    <string-array name="sim_selection_modes_titles">
+        <item>OS default</item>
+        <item>Round robin</item>
+        <item>Random</item>
+    </string-array>
+    <string-array name="sim_selection_modes_values">
+        <item>OSDefault</item>
+        <item>RoundRobin</item>
+        <item>Random</item>
+    </string-array>
+    <string-array name="processing_order_titles">
+        <item>LIFO (newer messages first)</item>
+        <item>FIFO (older messages first)</item>
+    </string-array>
+    <string-array name="processing_order_values" translatable="false">
+        <item>LIFO</item>
+        <item>FIFO</item>
+    </string-array>
+    <string-array name="notification_channels_titles">
+        <item>Auto</item>
+        <item>SSE Only</item>
+    </string-array>
+    <string-array name="notification_channels_values" translatable="false">
+        <item>AUTO</item>
+        <item>SSE_ONLY</item>
+    </string-array>
+    <string-array name="language_entries">
+        <item>@string/language_system</item>
+        <item>English</item>
+        <item>العربية</item>
+        <item>Русский</item>
+        <item>中文</item>
+    </string-array>
+    <string-array name="language_values">
+        <item></item>
+        <item>en</item>
+        <item>ar</item>
+        <item>ru</item>
+        <item>zh</item>
+    </string-array>
+</resources>

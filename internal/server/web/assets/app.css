@@ -503,6 +503,163 @@ textarea:focus {
   background: var(--teal-soft);
 }
 
+.settings-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.82fr);
+  gap: 14px;
+}
+
+.config-card {
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.config-card-wide {
+  grid-column: 1 / -1;
+}
+
+.config-card header {
+  display: flex;
+  align-items: flex-start;
+  gap: 13px;
+  margin-bottom: 16px;
+}
+
+.config-card h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.config-card p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.config-list {
+  margin: 0;
+  display: grid;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.config-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 138px minmax(0, 1fr);
+  border-bottom: 1px solid var(--line);
+}
+
+.config-row:last-child {
+  border-bottom: 0;
+}
+
+.config-row dt,
+.config-row dd {
+  min-width: 0;
+  margin: 0;
+  padding: 11px 12px;
+  overflow-wrap: anywhere;
+}
+
+.config-row dt {
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.config-row dd {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.config-row code,
+.env-block {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.config-row a {
+  color: var(--green);
+  text-decoration: none;
+}
+
+.config-row a:hover {
+  text-decoration: underline;
+}
+
+.config-actions {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.config-form {
+  display: grid;
+  gap: 13px;
+}
+
+.switch-field {
+  min-height: 48px;
+  padding: 12px;
+  align-items: center;
+  flex-direction: row;
+  justify-content: space-between;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.switch-field input[type="checkbox"] {
+  width: 42px;
+  height: 24px;
+  appearance: none;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: #d7dedb;
+  position: relative;
+  transition: background-color 150ms ease, border-color 150ms ease;
+}
+
+.switch-field input[type="checkbox"]::after {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(24, 33, 31, 0.24);
+  content: "";
+  transition: transform 150ms ease;
+}
+
+.switch-field input[type="checkbox"]:checked {
+  border-color: var(--green);
+  background: var(--green);
+}
+
+.switch-field input[type="checkbox"]:checked::after {
+  transform: translateX(18px);
+}
+
+.env-block {
+  margin: 0;
+  padding: 14px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #101917;
+  color: #eaf6f2;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
 .table-shell {
   width: 100%;
   overflow-x: auto;
@@ -847,7 +1004,7 @@ th:last-child {
 
 .mail-item {
   width: 100%;
-  min-height: 106px;
+  min-height: 78px;
   padding: 13px 14px;
   display: grid;
   gap: 5px;
@@ -980,6 +1137,15 @@ th:last-child {
   overflow-wrap: anywhere;
 }
 
+.mail-html-frame {
+  width: 100%;
+  min-height: 560px;
+  margin-top: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
 .mail-empty-list,
 .loading-state {
   min-height: 240px;
@@ -1067,6 +1233,13 @@ th:last-child {
 .field small {
   color: var(--subtle);
   font-size: 10px;
+}
+
+.field-help {
+  margin: 0;
+  color: var(--subtle);
+  font-size: 11px;
+  line-height: 1.6;
 }
 
 .field-error {
@@ -1184,6 +1357,10 @@ th:last-child {
     grid-template-columns: minmax(180px, 1fr) minmax(190px, 210px) repeat(2, 110px);
   }
 
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+
   .inbox-filters .button {
     grid-column: 1 / -1;
   }
@@ -1219,7 +1396,7 @@ th:last-child {
     height: 50px;
     margin: 0;
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 6px;
   }
 
@@ -1433,6 +1610,22 @@ th:last-child {
     grid-column: 1 / -1;
   }
 
+  .config-card {
+    padding: 14px;
+  }
+
+  .config-row {
+    grid-template-columns: 1fr;
+  }
+
+  .config-row dt {
+    padding-bottom: 4px;
+  }
+
+  .config-row dd {
+    padding-top: 4px;
+  }
+
   .mail-layout {
     height: auto;
     min-height: 0;
@@ -1452,7 +1645,7 @@ th:last-child {
   }
 
   .mail-item {
-    min-height: 98px;
+    min-height: 78px;
     border: 1px solid var(--line);
     border-radius: 8px;
     background: var(--surface);

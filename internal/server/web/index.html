@@ -27,6 +27,9 @@
         <button class="nav-item" type="button" data-view-target="inbox">
           <i data-lucide="inbox"></i><span>收件箱</span>
         </button>
+        <button class="nav-item" type="button" data-view-target="settings">
+          <i data-lucide="settings"></i><span>配置</span>
+        </button>
       </nav>
 
       <div class="service-state">
@@ -98,14 +101,14 @@
           <div class="section-heading section-heading-sticky">
             <div><h2>邮箱别名</h2><p id="aliases-summary">选择账号后加载</p></div>
             <button class="button button-primary" type="button" data-action="create-alias" id="create-alias-button">
-              <i data-lucide="plus"></i><span>创建别名</span>
+              <i data-lucide="plus"></i><span>领取别名</span>
             </button>
           </div>
 
           <div class="filter-bar">
             <label class="search-control">
               <i data-lucide="search"></i>
-              <input id="alias-search" type="search" placeholder="搜索邮箱或标签" autocomplete="off">
+              <input id="alias-search" type="search" placeholder="搜索邮箱或调用方" autocomplete="off">
             </label>
             <div class="segmented-control" id="alias-status-filter" aria-label="别名状态">
               <button type="button" class="is-selected" data-alias-filter="all">全部</button>
@@ -116,14 +119,14 @@
 
           <div class="table-shell" id="aliases-table-shell">
             <table>
-              <thead><tr><th>邮箱地址</th><th>标签</th><th>状态</th><th>创建时间</th><th class="align-right">操作</th></tr></thead>
+              <thead><tr><th>邮箱地址</th><th>状态</th><th>调用方使用记录</th><th>创建时间</th><th class="align-right">操作</th></tr></thead>
               <tbody id="aliases-body"></tbody>
             </table>
           </div>
           <div class="empty-state" id="aliases-empty" hidden>
             <span class="empty-icon"><i data-lucide="at-sign"></i></span>
             <h3 id="aliases-empty-title">暂无别名</h3>
-            <button class="button button-primary" type="button" data-action="create-alias"><i data-lucide="plus"></i><span>创建别名</span></button>
+            <button class="button button-primary" type="button" data-action="create-alias"><i data-lucide="plus"></i><span>领取别名</span></button>
           </div>
         </section>
 
@@ -156,6 +159,22 @@
               </div>
             </article>
           </div>
+        </section>
+
+        <section class="view" id="view-settings" data-view="settings" hidden>
+          <div class="section-heading">
+            <div><h2>重新登录与 OTP</h2><p id="settings-summary">读取当前服务配置</p></div>
+            <div class="command-row">
+              <button class="button button-secondary" type="button" data-action="refresh-relogin-config">
+                <i data-lucide="refresh-cw"></i><span>刷新配置</span>
+              </button>
+              <button class="button button-secondary" type="button" data-action="copy-relogin-env">
+                <i data-lucide="copy"></i><span>复制 .env 模板</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="settings-grid" id="relogin-config-panel"></div>
         </section>
       </div>
     </main>

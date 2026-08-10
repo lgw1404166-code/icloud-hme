@@ -35,6 +35,14 @@ const (
 	RequestTimeout = 15 * time.Second
 	// MaxRetries 最大重试次数。
 	MaxRetries = 3
+
+	appleIDAPIBase = "https://appleid.apple.com"
+	appleIDOrigin  = "https://account.apple.com"
+	browserUA      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+
+	accountSCNTCookieKey   = "__apple_account_scnt"
+	accountAPIKeyCookieKey = "__apple_account_api_key"
+	accountFDCookieKey     = "__apple_account_fd_client_info"
 )
 
 var retryDelays = []time.Duration{
@@ -54,11 +62,14 @@ type AccountInfo struct {
 
 // Alias 是一个 Hide My Email 隐私邮箱别名。
 type Alias struct {
-	Email       string `json:"email"`
-	AnonymousID string `json:"anonymousId"`
-	Label       string `json:"label"`
-	Active      bool   `json:"active"`
-	CreatedAt   string `json:"createdAt,omitempty"`
+	Email       string   `json:"email"`
+	AnonymousID string   `json:"anonymousId"`
+	Label       string   `json:"label"`
+	Active      bool     `json:"active"`
+	CreatedAt   string   `json:"createdAt,omitempty"`
+	UsedBy      []string `json:"used_by,omitempty"`
+	UsedByCount int      `json:"used_by_count,omitempty"`
+	LastUsedAt  string   `json:"last_used_at,omitempty"`
 }
 
 // HTTPError 描述 iCloud 返回的非 2xx 响应。
@@ -67,6 +78,11 @@ type HTTPError struct {
 	StatusCode int
 	Body       string
 	RetryAfter time.Duration
+}
+
+type hmeHTTPClient interface {
+	Do(req *http.Request) (*http.Response, error)
+	GetCookies(u *url.URL) []*http.Cookie
 }
 
 func (e *HTTPError) Error() string {
@@ -81,16 +97,19 @@ func (e *HTTPError) Error() string {
 // 一个 Client 对应一个 iCloud 账号。通过传入的 Cookie 维持会话,
 // 首次调用业务方法时会自动触发 ValidateSession 解析 HME 服务端点。
 type Client struct {
-	Cookies     map[string]string
-	Host        string // "icloud.com" 或 "icloud.com.cn"
-	Proxy       string // HTTP/SOCKS5 代理
-	Verbose     bool
-	httpc       tls_client.HttpClient
-	setupURL    string
-	serviceURL  string
-	dsid        string // 从 validate 响应提取
-	clientID    string // 稳定 UUID，由账号管理器持久化
-	accountInfo *AccountInfo
+	Cookies         map[string]string
+	Host            string // "icloud.com" 或 "icloud.com.cn"
+	Proxy           string // HTTP/SOCKS5 代理
+	Verbose         bool
+	httpc           hmeHTTPClient
+	setupURL        string
+	serviceURL      string
+	dsid            string // 从 validate 响应提取
+	clientID        string // 稳定 UUID，由账号管理器持久化
+	accountAPIKey   string
+	accountSCNT     string
+	accountFDClient string
+	accountInfo     *AccountInfo
 }
 
 // NewClient 创建一个新的 HME 客户端,底层使用 Chrome TLS 指纹。
@@ -131,12 +150,15 @@ func NewClientWithID(cookies map[string]string, host, proxy, clientID string, ve
 	}
 
 	c := &Client{
-		Cookies:  cookies,
-		Host:     normalizeHost(host),
-		Proxy:    proxy,
-		Verbose:  verbose,
-		httpc:    httpc,
-		clientID: clientID,
+		Cookies:         cookies,
+		Host:            normalizeHost(host),
+		Proxy:           proxy,
+		Verbose:         verbose,
+		httpc:           httpc,
+		clientID:        clientID,
+		accountAPIKey:   firstCookieValue(cookies, accountAPIKeyCookieKey, "X-Apple-Api-Key"),
+		accountSCNT:     firstCookieValue(cookies, accountSCNTCookieKey, "scnt"),
+		accountFDClient: firstCookieValue(cookies, accountFDCookieKey, "X-Apple-I-FD-Client-Info"),
 	}
 
 	// 把传入的 Cookie 灌入 jar,后续请求自动携带。
@@ -147,6 +169,9 @@ func NewClientWithID(cookies map[string]string, host, proxy, clientID string, ve
 			"https://www.icloud.com.cn",
 			"https://setup.icloud.com",
 			"https://setup.icloud.com.cn",
+			appleIDAPIBase,
+			appleIDOrigin,
+			"https://apple.com",
 			"https://" + c.Host,
 		}
 
@@ -185,6 +210,71 @@ func cloneCookies(cookies map[string]string) map[string]string {
 		cloned[name] = value
 	}
 	return cloned
+}
+
+func firstCookieValue(cookies map[string]string, names ...string) string {
+	for _, name := range names {
+		for cookieName, value := range cookies {
+			if strings.EqualFold(cookieName, name) && strings.TrimSpace(value) != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+var accountSessionCookieNames = map[string]struct{}{
+	"myacinfo": {},
+	"caw":      {},
+	"caw-at":   {},
+	"awat":     {},
+	"aidsp":    {},
+}
+
+var accountMetadataCookieNames = map[string]struct{}{
+	strings.ToLower(accountSCNTCookieKey):   {},
+	strings.ToLower(accountAPIKeyCookieKey): {},
+	strings.ToLower(accountFDCookieKey):     {},
+	"scnt":                                  {},
+	"x-apple-api-key":                       {},
+	"x-apple-i-fd-client-info":              {},
+}
+
+// UsesAccountAPI 表示 Cookie 中包含 account.apple.com 的账户管理会话。
+// 该会话使用官网 /account/manage/email/private 接口，不经过 maildomainws 限流桶。
+func (c *Client) UsesAccountAPI() bool {
+	for name, value := range c.Cookies {
+		if value == "" {
+			continue
+		}
+		if _, ok := accountSessionCookieNames[strings.ToLower(name)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func buildCookieHeader(cookies map[string]string, quoteValues bool) string {
+	names := make([]string, 0, len(cookies))
+	for name, value := range cookies {
+		if strings.TrimSpace(name) == "" || value == "" {
+			continue
+		}
+		if _, metadata := accountMetadataCookieNames[strings.ToLower(name)]; metadata {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		value := cookies[name]
+		if quoteValues && !strings.HasPrefix(value, `"`) {
+			value = `"` + value + `"`
+		}
+		parts = append(parts, name+"="+value)
+	}
+	return strings.Join(parts, "; ")
 }
 
 func normalizeHost(host string) string {
@@ -300,20 +390,11 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 		req.Header.Set("sec-ch-ua", `"Google Chrome";v="146", "Not.A/Brand";v="8", "Chromium";v="146"`)
 		req.Header.Set("sec-ch-ua-mobile", "?0")
 		req.Header.Set("sec-ch-ua-platform", `"Windows"`)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+		req.Header.Set("User-Agent", browserUA)
 
 		// 手动添加 Cookie 头（确保跨域也能传递）
 		// 浏览器发送的 Cookie 值带双引号,iCloud 严格匹配
-		if len(c.Cookies) > 0 {
-			cookieParts := make([]string, 0, len(c.Cookies))
-			for k, v := range c.Cookies {
-				if strings.HasPrefix(v, `"`) {
-					cookieParts = append(cookieParts, k+"="+v)
-				} else {
-					cookieParts = append(cookieParts, k+`="`+v+`"`)
-				}
-			}
-			cookieHeader := strings.Join(cookieParts, "; ")
+		if cookieHeader := buildCookieHeader(c.Cookies, true); cookieHeader != "" {
 			req.Header.Set("Cookie", cookieHeader)
 		}
 		c.log(">>> %s %s", method, fullURL)
@@ -363,6 +444,168 @@ func (c *Client) request(method, rawURL string, body any, timeout time.Duration,
 		return "", lastErr
 	}
 	return "", fmt.Errorf("未知错误")
+}
+
+type accountFDClientInfo struct {
+	UserAgent string `json:"U"`
+	Language  string `json:"L"`
+	TimeZone  string `json:"Z"`
+	Version   string `json:"V"`
+	FDC       string `json:"F,omitempty"`
+}
+
+type accountPrivateEmail struct {
+	EmailAddress        string `json:"emailAddress"`
+	Label               string `json:"label"`
+	Note                string `json:"note"`
+	ID                  string `json:"id"`
+	Type                string `json:"type"`
+	DisplayName         string `json:"displayName"`
+	CreatedDate         string `json:"createdDate"`
+	IneligibilityReason string `json:"ineligibilityReason"`
+	Exists              bool   `json:"exists"`
+	Active              bool   `json:"active"`
+}
+
+type accountCreatePayload struct {
+	EmailAddress string `json:"emailAddress"`
+	Label        string `json:"label"`
+	Note         string `json:"note"`
+}
+
+func defaultAccountFDClientInfo() string {
+	_, offset := time.Now().Zone()
+	sign := '+'
+	if offset < 0 {
+		sign = '-'
+		offset = -offset
+	}
+	timeZone := fmt.Sprintf("GMT%c%02d:%02d", sign, offset/3600, offset%3600/60)
+	raw, _ := json.Marshal(accountFDClientInfo{
+		UserAgent: browserUA,
+		Language:  "zh-CN",
+		TimeZone:  timeZone,
+		Version:   "1.1",
+	})
+	return string(raw)
+}
+
+func localIANATimeZone() string {
+	name := time.Now().Location().String()
+	if name == "" || name == "Local" {
+		return "Asia/Shanghai"
+	}
+	return name
+}
+
+// accountRequest 执行 account.apple.com 当前网页使用的账户管理请求。
+// 该协议的 Cookie 不加引号，并在每次响应后滚动保存 scnt 和短期会话 Cookie。
+func (c *Client) accountRequest(method, path string, body any, requireAPIKey bool) (string, error) {
+	var reqBody io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return "", err
+		}
+		reqBody = bytes.NewReader(raw)
+	}
+
+	req, err := http.NewRequest(method, appleIDAPIBase+path, reqBody)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Origin", appleIDOrigin)
+	req.Header.Set("Referer", appleIDOrigin+"/")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	req.Header.Set("User-Agent", browserUA)
+	req.Header.Set("X-Apple-I-Request-Context", "ca")
+	req.Header.Set("X-Apple-I-TimeZone", localIANATimeZone())
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.accountSCNT != "" {
+		req.Header.Set("scnt", c.accountSCNT)
+	}
+	if requireAPIKey {
+		if c.accountAPIKey == "" {
+			return "", fmt.Errorf("Apple 账户管理会话缺少 X-Apple-Api-Key")
+		}
+		req.Header.Set("X-Apple-Api-Key", c.accountAPIKey)
+	}
+	fdClientInfo := c.accountFDClient
+	if fdClientInfo == "" {
+		fdClientInfo = defaultAccountFDClientInfo()
+	}
+	req.Header.Set("X-Apple-I-FD-Client-Info", fdClientInfo)
+	if cookieHeader := buildCookieHeader(c.Cookies, false); cookieHeader != "" {
+		req.Header.Set("Cookie", cookieHeader)
+	}
+
+	c.log(">>> %s %s", method, appleIDAPIBase+path)
+	resp, err := c.httpc.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("Apple 账户接口连接失败: %w", err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if scnt := strings.TrimSpace(resp.Header.Get("scnt")); scnt != "" {
+		c.accountSCNT = scnt
+		c.Cookies[accountSCNTCookieKey] = scnt
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name != "" && cookie.Value != "" {
+			c.Cookies[cookie.Name] = cookie.Value
+		}
+	}
+	// tls-client 的 CookieJar 可能已经接收了跨域 Set-Cookie,但 fhttp
+	// 响应不一定暴露全部 Cookie;同步 jar,确保 caw-at/awat 滚动后能被下次请求使用。
+	if u, parseErr := url.Parse(appleIDAPIBase + path); parseErr == nil {
+		for _, cookie := range c.httpc.GetCookies(u) {
+			if cookie.Name != "" && cookie.Value != "" {
+				c.Cookies[cookie.Name] = cookie.Value
+			}
+		}
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		httpErr := &HTTPError{
+			StatusCode: resp.StatusCode,
+			Body:       sanitizeResponseBody(responseBody),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		}
+		c.log("<<< %s", httpErr.Error())
+		return "", httpErr
+	}
+	return string(responseBody), nil
+}
+
+// ValidateAccountSession 初始化官网账户管理会话，并取得动态 API Key。
+func (c *Client) ValidateAccountSession() error {
+	if !c.UsesAccountAPI() {
+		return fmt.Errorf("缺少 account.apple.com 会话 Cookie，请同时导入 Apple 账户页面 Cookie")
+	}
+	if _, err := c.accountRequest("GET", "/account/manage/gs/ws/token", nil, false); err != nil {
+		return fmt.Errorf("Apple 账户令牌初始化失败: %w", err)
+	}
+	body, err := c.accountRequest("GET", "/account/manage", nil, false)
+	if err != nil {
+		return fmt.Errorf("Apple 账户会话校验失败: %w", err)
+	}
+	apiKey := strings.TrimSpace(gjson.Get(body, "apiKey").String())
+	if apiKey == "" {
+		return fmt.Errorf("Apple 账户会话响应缺少 apiKey")
+	}
+	c.accountAPIKey = apiKey
+	c.Cookies[accountAPIKeyCookieKey] = apiKey
+	if c.accountFDClient != "" {
+		c.Cookies[accountFDCookieKey] = c.accountFDClient
+	}
+	return nil
 }
 
 func sanitizeResponseBody(body []byte) string {
@@ -497,6 +740,9 @@ func (c *Client) resolveService() error {
 
 // ListAliases 列出当前账号所有 Hide My Email 别名。
 func (c *Client) ListAliases() ([]Alias, error) {
+	if c.UsesAccountAPI() {
+		return c.listAccountAliases()
+	}
 	if err := c.resolveService(); err != nil {
 		return nil, err
 	}
@@ -507,6 +753,39 @@ func (c *Client) ListAliases() ([]Alias, error) {
 	}
 	aliases := parseAliasList(body)
 	c.log("共 %d 个别名", len(aliases))
+	return aliases, nil
+}
+
+func (c *Client) listAccountAliases() ([]Alias, error) {
+	if err := c.ValidateAccountSession(); err != nil {
+		return nil, err
+	}
+	body, err := c.accountRequest("GET", "/account/manage/email/private", nil, true)
+	if err != nil {
+		return nil, err
+	}
+	var response struct {
+		PrivateEmailList         []accountPrivateEmail `json:"privateEmailList"`
+		InactivePrivateEmailList []accountPrivateEmail `json:"inactivePrivateEmailList"`
+	}
+	if err := json.Unmarshal([]byte(body), &response); err != nil {
+		return nil, fmt.Errorf("解析 Apple 账户别名列表失败: %w", err)
+	}
+	items := append(response.PrivateEmailList, response.InactivePrivateEmailList...)
+	aliases := make([]Alias, 0, len(items))
+	for _, item := range items {
+		if item.EmailAddress == "" {
+			continue
+		}
+		aliases = append(aliases, Alias{
+			Email:       strings.ToLower(item.EmailAddress),
+			AnonymousID: item.ID,
+			Label:       firstNonEmpty(item.Label, item.DisplayName),
+			Active:      item.Active,
+			CreatedAt:   item.CreatedDate,
+		})
+	}
+	c.log("官网账户接口共返回 %d 个别名", len(aliases))
 	return aliases, nil
 }
 
@@ -542,17 +821,24 @@ func (c *Client) Generate() (string, error) {
 
 // Reserve 保留/确认候选别名,使其正式生效。
 func (c *Client) Reserve(hme, label string) (string, error) {
+	return c.reserveWithNote(hme, label, "")
+}
+
+func (c *Client) reserveWithNote(hme, label, note string) (string, error) {
 	if err := c.resolveService(); err != nil {
 		return "", err
 	}
 	if label == "" {
 		label = "Created " + time.Now().Format("2006-01-02 15:04")
 	}
+	if note == "" {
+		note = "Created by icloud-hme tool"
+	}
 	c.log("保留别名 %s ...", hme)
 	payload := map[string]string{
 		"hme":   hme,
 		"label": label,
-		"note":  "Created by icloud_hme tool",
+		"note":  note,
 	}
 	body, err := c.request("POST", c.serviceURL+"/v1/hme/reserve", payload, 0, 1)
 	if err != nil {
@@ -576,15 +862,91 @@ func (c *Client) Reserve(hme, label string) (string, error) {
 
 // CreateResult 是 CreateAlias 的返回结果。
 type CreateResult struct {
-	Email     string `json:"email"`
-	Label     string `json:"label"`
-	CreatedAt string `json:"created_at"`
+	Email       string `json:"email"`
+	AnonymousID string `json:"anonymousId,omitempty"`
+	Label       string `json:"label"`
+	Note        string `json:"note"`
+	CreatedAt   string `json:"created_at"`
+	Protocol    string `json:"protocol"`
 }
 
 // CreateAlias 一步完成「生成 + 保留」,创建一个新别名。
 //
 // maxRetries 仅为兼容已有调用保留；服务端创建接口固定传 1，避免放大 Apple 风控。
 func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error) {
+	return c.CreateAliasWithNote(label, "", maxRetries)
+}
+
+// CreateAliasWithNote 创建别名，并与官网一样允许同时设置标签和备注。
+func (c *Client) CreateAliasWithNote(label, note string, maxRetries int) (*CreateResult, error) {
+	if c.UsesAccountAPI() {
+		return c.createAccountAlias(label, note)
+	}
+	return c.createLegacyAlias(label, note, maxRetries)
+}
+
+func (c *Client) createAccountAlias(label, note string) (*CreateResult, error) {
+	if err := c.ValidateAccountSession(); err != nil {
+		return nil, err
+	}
+	if label == "" {
+		label = "Created " + time.Now().Format("2006-01-02 15:04")
+	}
+	if note == "" {
+		note = "Created by icloud-hme tool"
+	}
+
+	generatedBody, err := c.accountRequest("POST", "/account/manage/email/private/add", map[string]any{}, true)
+	if err != nil {
+		return nil, fmt.Errorf("官网生成候选别名失败: %w", err)
+	}
+	var generated accountPrivateEmail
+	if err := json.Unmarshal([]byte(generatedBody), &generated); err != nil {
+		return nil, fmt.Errorf("解析官网候选别名失败: %w", err)
+	}
+	if generated.EmailAddress == "" {
+		return nil, fmt.Errorf("官网生成候选别名响应缺少 emailAddress")
+	}
+
+	payload := accountCreatePayload{
+		EmailAddress: generated.EmailAddress,
+		Label:        label,
+		Note:         note,
+	}
+	completedBody, err := c.accountRequest("PUT", "/account/manage/email/private/add/complete", payload, true)
+	if err != nil {
+		return nil, fmt.Errorf("官网确认候选别名失败: %w", err)
+	}
+	var completed accountPrivateEmail
+	if err := json.Unmarshal([]byte(completedBody), &completed); err != nil {
+		return nil, fmt.Errorf("解析官网创建结果失败: %w", err)
+	}
+	if completed.EmailAddress == "" {
+		completed.EmailAddress = generated.EmailAddress
+	}
+	if completed.ID != "" {
+		detailBody, detailErr := c.accountRequest("GET", "/account/manage/email/private/"+url.PathEscape(completed.ID)+".em", nil, true)
+		if detailErr == nil {
+			var detail accountPrivateEmail
+			if json.Unmarshal([]byte(detailBody), &detail) == nil && detail.EmailAddress != "" {
+				completed = detail
+			}
+		}
+	}
+	return &CreateResult{
+		Email:       strings.ToLower(completed.EmailAddress),
+		AnonymousID: completed.ID,
+		Label:       firstNonEmpty(completed.Label, label),
+		Note:        firstNonEmpty(completed.Note, note),
+		CreatedAt:   firstNonEmpty(completed.CreatedDate, time.Now().Format(time.RFC3339)),
+		Protocol:    "apple_account",
+	}, nil
+}
+
+func (c *Client) createLegacyAlias(label, note string, maxRetries int) (*CreateResult, error) {
+	if note == "" {
+		note = "Created by icloud-hme tool"
+	}
 	if maxRetries <= 0 {
 		maxRetries = 1
 	}
@@ -605,7 +967,7 @@ func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error
 			}
 			break
 		}
-		email, err := c.Reserve(hme, label)
+		email, err := c.reserveWithNote(hme, label, note)
 		if err != nil {
 			lastErr = fmt.Errorf("reserve 失败: %w", err)
 			c.log("%v", lastErr)
@@ -616,9 +978,11 @@ func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error
 			break
 		}
 		return &CreateResult{
-			Email:     email,
+			Email:     strings.ToLower(email),
 			Label:     label,
+			Note:      note,
 			CreatedAt: time.Now().Format(time.RFC3339),
+			Protocol:  "icloud_maildomainws",
 		}, nil
 	}
 	if lastErr != nil {
@@ -629,6 +993,13 @@ func (c *Client) CreateAlias(label string, maxRetries int) (*CreateResult, error
 
 // DeactivateHME 停用别名(可恢复)。
 func (c *Client) DeactivateHME(anonymousID string) (bool, error) {
+	if c.UsesAccountAPI() {
+		if err := c.ValidateAccountSession(); err != nil {
+			return false, err
+		}
+		_, err := c.accountRequest("DELETE", "/account/manage/email/private/"+url.PathEscape(anonymousID)+"/stop", nil, true)
+		return err == nil, err
+	}
 	if err := c.resolveService(); err != nil {
 		return false, err
 	}
@@ -643,6 +1014,13 @@ func (c *Client) DeactivateHME(anonymousID string) (bool, error) {
 
 // ReactivateHME 激活已停用的别名。
 func (c *Client) ReactivateHME(anonymousID string) (bool, error) {
+	if c.UsesAccountAPI() {
+		if err := c.ValidateAccountSession(); err != nil {
+			return false, err
+		}
+		_, err := c.accountRequest("POST", "/account/manage/email/private/"+url.PathEscape(anonymousID)+"/reactivate", nil, true)
+		return err == nil, err
+	}
 	if err := c.resolveService(); err != nil {
 		return false, err
 	}
@@ -657,6 +1035,21 @@ func (c *Client) ReactivateHME(anonymousID string) (bool, error) {
 
 // Delete 删除别名。若直接删除失败会先停用再删。
 func (c *Client) Delete(anonymousID string) error {
+	if c.UsesAccountAPI() {
+		if err := c.ValidateAccountSession(); err != nil {
+			return err
+		}
+		removePath := "/account/manage/email/private/" + url.PathEscape(anonymousID) + "/remove"
+		if _, err := c.accountRequest("DELETE", removePath, nil, true); err == nil {
+			return nil
+		}
+		stopPath := "/account/manage/email/private/" + url.PathEscape(anonymousID) + "/stop"
+		if _, err := c.accountRequest("DELETE", stopPath, nil, true); err != nil {
+			return err
+		}
+		_, err := c.accountRequest("DELETE", removePath, nil, true)
+		return err
+	}
 	if err := c.resolveService(); err != nil {
 		return err
 	}
