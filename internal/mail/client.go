@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	stdhtml "html"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -23,6 +22,7 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-message/charset"
+	"golang.org/x/net/html"
 )
 
 const (
@@ -103,6 +103,14 @@ func (c *Client) Disconnect() {
 		_ = c.cli.Logout()
 		c.cli = nil
 	}
+}
+
+// Noop 检查当前 IMAP 会话是否仍然可用。
+func (c *Client) Noop() error {
+	if c.cli == nil {
+		return fmt.Errorf("未连接")
+	}
+	return c.cli.Noop()
 }
 
 // InboxCount 返回收件箱邮件总数。
@@ -205,37 +213,51 @@ func (c *Client) FindByRecipient(recipient string, limit int, days int) ([]Messa
 
 // FindByRecipientInFolder 在指定邮件夹查找收件人。folder 为空时查询 INBOX 和 Junk。
 func (c *Client) FindByRecipientInFolder(recipient, folder string, limit int, days int) ([]Message, error) {
+	messages, _, err := c.FindByRecipientPage(recipient, folder, limit, 0, days)
+	return messages, err
+}
+
+// FindByRecipientPage 按收件人分页查询邮件，并返回符合条件的邮件总数。
+func (c *Client) FindByRecipientPage(recipient, folder string, limit, offset, days int) ([]Message, int, error) {
 	if c.cli == nil {
-		return nil, fmt.Errorf("未连接")
+		return nil, 0, fmt.Errorf("未连接")
 	}
 	if limit <= 0 {
 		limit = 20
 	}
+	if offset < 0 {
+		offset = 0
+	}
 	folder, err := NormalizeFolder(folder)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+	fetchLimit := offset + limit
 	if folder == FolderAll {
-		inbox, err := c.findByRecipientMailbox(recipient, inboxMailbox, FolderInbox, limit, days)
+		inbox, inboxTotal, err := c.findByRecipientMailbox(recipient, inboxMailbox, FolderInbox, fetchLimit, days)
 		if err != nil {
-			return nil, fmt.Errorf("搜索收件箱失败: %w", err)
+			return nil, 0, fmt.Errorf("搜索收件箱失败: %w", err)
 		}
-		junk, err := c.findByRecipientMailbox(recipient, junkMailbox, FolderJunk, limit, days)
+		junk, junkTotal, err := c.findByRecipientMailbox(recipient, junkMailbox, FolderJunk, fetchLimit, days)
 		if err != nil {
-			return nil, fmt.Errorf("搜索垃圾邮件失败: %w", err)
+			return nil, 0, fmt.Errorf("搜索垃圾邮件失败: %w", err)
 		}
-		return mergeMessages(limit, inbox, junk), nil
+		return paginateMessages(mergeMessages(0, inbox, junk), offset, limit), inboxTotal + junkTotal, nil
 	}
 	mailbox, _ := mailboxForFolder(folder)
-	return c.findByRecipientMailbox(recipient, mailbox, folder, limit, days)
+	messages, total, err := c.findByRecipientMailbox(recipient, mailbox, folder, fetchLimit, days)
+	if err != nil {
+		return nil, 0, err
+	}
+	return paginateMessages(messages, offset, limit), total, nil
 }
 
 // findByRecipientMailbox 先尝试 IMAP TO 搜索，失败则拉取邮件后本地过滤。
-func (c *Client) findByRecipientMailbox(recipient, mailbox, folder string, limit int, days int) ([]Message, error) {
+func (c *Client) findByRecipientMailbox(recipient, mailbox, folder string, limit int, days int) ([]Message, int, error) {
 	// 先尝试服务端 TO 搜索
 	_, err := c.cli.Select(mailbox, true)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	criteria := imap.NewSearchCriteria()
 	criteria.Header.Add("To", recipient)
@@ -244,14 +266,15 @@ func (c *Client) findByRecipientMailbox(recipient, mailbox, folder string, limit
 		criteria.Since = since
 	}
 	uids, err := c.cli.UidSearch(criteria)
-	if err == nil && len(uids) > 0 {
-		return c.fetchByUIDs(uids, limit, folder)
+	if err == nil {
+		messages, fetchErr := c.fetchByUIDs(uids, limit, folder)
+		return messages, len(uids), fetchErr
 	}
 
 	// fallback: 拉取当前邮件夹后本地过滤
 	all, err := c.listMailbox(mailbox, folder, limit*3, days)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	recipient = strings.ToLower(recipient)
 	out := make([]Message, 0, limit)
@@ -263,7 +286,7 @@ func (c *Client) findByRecipientMailbox(recipient, mailbox, folder string, limit
 			}
 		}
 	}
-	return out, nil
+	return out, len(out), nil
 }
 
 func (c *Client) fetchByUIDs(uids []uint32, limit int, folder string) ([]Message, error) {
@@ -331,6 +354,22 @@ func mergeMessages(limit int, groups ...[]Message) []Message {
 		merged = merged[:limit]
 	}
 	return merged
+}
+
+// MergeMessagePages 合并多个邮件夹的结果，按时间倒序后截取指定页。
+func MergeMessagePages(offset, limit int, groups ...[]Message) []Message {
+	return paginateMessages(mergeMessages(0, groups...), offset, limit)
+}
+
+func paginateMessages(messages []Message, offset, limit int) []Message {
+	if offset >= len(messages) || limit <= 0 {
+		return []Message{}
+	}
+	end := offset + limit
+	if end > len(messages) {
+		end = len(messages)
+	}
+	return messages[offset:end]
 }
 
 func sortMessages(messages []Message) {
@@ -417,9 +456,9 @@ func (c *Client) GetFullByID(messageID string) (*FullMessage, error) {
 	// 解析正文
 	if r := msg.GetBody(section); r != nil {
 		if em, err := mail.ReadMessage(r); err == nil {
-			body, htmlBody, contentType, _ := readBodyParts(em)
+			body, htmlBody, contentType, inlineImages, _ := readBodyPartsWithInline(em)
 			full.Body = body
-			full.HTML = htmlBody
+			full.HTML = rewriteCIDImages(htmlBody, inlineImages)
 			full.IsHTML = htmlBody != ""
 			full.ContentType = contentType
 			if full.Body == "" && full.HTML != "" {
@@ -491,8 +530,6 @@ func decodeHeader(s string) string {
 	return out
 }
 
-var htmlTag = regexp.MustCompile(`<[^>]+>`)
-
 func parseMessageID(messageID string) (string, uint32, error) {
 	messageID = strings.TrimSpace(messageID)
 	folder := FolderInbox
@@ -525,6 +562,17 @@ func readBody(msg *mail.Message) (string, error) {
 
 // readBodyParts 解析 text/plain、text/html 以及 multipart/alternative 邮件。
 func readBodyParts(msg *mail.Message) (plain, htmlBody, contentType string, err error) {
+	plain, htmlBody, contentType, _, err = readBodyPartsWithInline(msg)
+	return
+}
+
+func readBodyPartsWithInline(msg *mail.Message) (plain, htmlBody, contentType string, inlineImages map[string]string, err error) {
+	inlineImages = make(map[string]string)
+	plain, htmlBody, contentType, err = readBodyPartsInto(msg, inlineImages)
+	return
+}
+
+func readBodyPartsInto(msg *mail.Message, inlineImages map[string]string) (plain, htmlBody, contentType string, err error) {
 	if msg == nil {
 		return "", "", "", fmt.Errorf("邮件正文为空")
 	}
@@ -549,12 +597,8 @@ func readBodyParts(msg *mail.Message) (plain, htmlBody, contentType string, err 
 			if nextErr != nil {
 				return plain, htmlBody, contentType, nextErr
 			}
-			disposition := strings.ToLower(part.Header.Get("Content-Disposition"))
-			if strings.HasPrefix(disposition, "attachment") {
-				continue
-			}
 			nested := &mail.Message{Header: mail.Header(part.Header), Body: part}
-			partPlain, partHTML, _, partErr := readBodyParts(nested)
+			partPlain, partHTML, _, partErr := readBodyPartsInto(nested, inlineImages)
 			if partErr != nil {
 				continue
 			}
@@ -581,11 +625,35 @@ func readBodyParts(msg *mail.Message) (plain, htmlBody, contentType string, err 
 	}
 	text := string(raw)
 	switch strings.ToLower(mediaType) {
+	case "text/plain":
+		return strings.TrimSpace(text), "", contentType, nil
 	case "text/html", "application/xhtml+xml":
 		return "", text, contentType, nil
 	default:
-		return strings.TrimSpace(text), "", contentType, nil
+		if mediaType == "" || strings.HasPrefix(strings.ToLower(mediaType), "text/") {
+			return strings.TrimSpace(text), "", contentType, nil
+		}
+		contentID := strings.Trim(strings.TrimSpace(msg.Header.Get("Content-ID")), "<>")
+		if strings.HasPrefix(strings.ToLower(mediaType), "image/") && contentID != "" && len(raw) <= 15*1024*1024 {
+			inlineImages[strings.ToLower(contentID)] = "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(raw)
+		}
+		return "", "", contentType, nil
 	}
+}
+
+var cidReferencePattern = regexp.MustCompile(`(?i)cid:[^\s"'()<>]+`)
+
+func rewriteCIDImages(rawHTML string, inlineImages map[string]string) string {
+	if rawHTML == "" || len(inlineImages) == 0 {
+		return rawHTML
+	}
+	return cidReferencePattern.ReplaceAllStringFunc(rawHTML, func(reference string) string {
+		contentID := strings.ToLower(strings.TrimPrefix(strings.ToLower(reference), "cid:"))
+		if dataURL, ok := inlineImages[contentID]; ok {
+			return dataURL
+		}
+		return reference
+	})
 }
 
 func readTransferDecoded(body io.Reader, encoding string) ([]byte, error) {
@@ -614,24 +682,66 @@ func firstLine(value string) string {
 	return value
 }
 
-// stripHTML 粗略剥离 HTML 标签,保留可读文本。
-func stripHTML(html string) string {
-	// 换行标签转换行
-	html = strings.ReplaceAll(html, "<br>", "\n")
-	html = strings.ReplaceAll(html, "<br/>", "\n")
-	html = strings.ReplaceAll(html, "<br />", "\n")
-	html = strings.ReplaceAll(html, "</p>", "\n")
-	html = strings.ReplaceAll(html, "</div>", "\n")
-	html = strings.ReplaceAll(html, "</tr>", "\n")
-	html = strings.ReplaceAll(html, "<li>", "\n- ")
-	// 去掉所有标签
-	html = htmlTag.ReplaceAllString(html, "")
-	// 反转义常见实体
-	html = strings.ReplaceAll(stdhtml.UnescapeString(html), "\u00a0", " ")
-	// 压缩多余空白
-	lines := strings.Split(html, "\n")
-	for i, l := range lines {
-		lines[i] = strings.TrimSpace(l)
+// stripHTML 提取邮件 HTML 中的可读正文，忽略 head、样式和脚本内容。
+func stripHTML(raw string) string {
+	doc, err := html.Parse(strings.NewReader(raw))
+	if err != nil {
+		return strings.TrimSpace(raw)
 	}
-	return strings.TrimSpace(strings.Join(lines, "\n"))
+	var body *html.Node
+	var findBody func(*html.Node)
+	findBody = func(node *html.Node) {
+		if body != nil {
+			return
+		}
+		if node.Type == html.ElementNode && strings.EqualFold(node.Data, "body") {
+			body = node
+			return
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			findBody(child)
+		}
+	}
+	findBody(doc)
+	if body == nil {
+		body = doc
+	}
+
+	var text strings.Builder
+	block := map[string]bool{"p": true, "div": true, "tr": true, "table": true, "section": true, "article": true, "header": true, "footer": true, "h1": true, "h2": true, "h3": true, "h4": true, "h5": true, "h6": true}
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.ElementNode {
+			tag := strings.ToLower(node.Data)
+			switch tag {
+			case "head", "style", "script", "noscript", "svg", "template":
+				return
+			case "br":
+				text.WriteByte('\n')
+			case "li":
+				text.WriteString("\n- ")
+			}
+		}
+		if node.Type == html.TextNode {
+			text.WriteString(node.Data)
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+		if node.Type == html.ElementNode && block[strings.ToLower(node.Data)] {
+			text.WriteByte('\n')
+		}
+	}
+	walk(body)
+
+	lines := strings.Split(strings.ReplaceAll(text.String(), "\u00a0", " "), "\n")
+	clean := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.Join(strings.Fields(line), " ")
+		if line == "" && (len(clean) == 0 || clean[len(clean)-1] == "") {
+			continue
+		}
+		clean = append(clean, line)
+	}
+	return strings.TrimSpace(strings.Join(clean, "\n"))
 }

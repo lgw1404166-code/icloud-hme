@@ -46,6 +46,14 @@ type Server struct {
 	relogin               ReloginConfig
 	otpMu                 sync.Mutex
 	otpCodes              []otpCodeRecord
+	poolMu                sync.Mutex
+	poolConfig            AliasPoolConfig
+	poolStop              chan struct{}
+	poolLogMu             sync.Mutex
+	poolLogs              []aliasPoolLogEntry
+	imapMu                sync.Mutex
+	imapSessions          map[string]*imapSession
+	inboxCache            inboxCacheStore
 }
 
 // New 创建 Server。debug 为 true 时启用 Gin 调试日志。
@@ -65,6 +73,9 @@ func New(mgr *account.Manager, debug bool, apiKeys ...string) *Server {
 		createMinInterval:     defaultCreateMinInterval,
 		createFailureCooldown: defaultCreateFailureCooldown,
 		relogin:               ReloginConfigFromEnv(),
+		poolConfig:            AliasPoolConfigFromEnv(),
+		imapSessions:          make(map[string]*imapSession),
+		inboxCache:            inboxCacheStore{entries: make(map[string]inboxCacheEntry)},
 	}
 	s.r = gin.Default() // 自带 Logger + Recovery 中间件
 	s.register()
@@ -73,6 +84,7 @@ func New(mgr *account.Manager, debug bool, apiKeys ...string) *Server {
 
 // Run 启动 HTTP 服务。
 func (s *Server) Run(addr string) error {
+	s.warmIMAPSessions()
 	return s.r.Run(addr)
 }
 
@@ -111,6 +123,9 @@ func (s *Server) register() {
 		api.GET("/otp/latest", s.latestOTP)
 		api.GET("/relogin/config", s.reloginConfig)
 		api.PUT("/relogin/config", s.updateReloginConfig)
+		api.GET("/alias-pool/config", s.aliasPoolConfig)
+		api.PUT("/alias-pool/config", s.updateAliasPoolConfig)
+		api.GET("/alias-pool/logs", s.aliasPoolLogs)
 	}
 }
 
@@ -360,43 +375,86 @@ func (s *Server) listInbox(c *gin.Context) {
 	}
 	alias := strings.TrimSpace(c.Query("alias"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
-	days, _ := strconv.Atoi(c.DefaultQuery("days", "7"))
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	offset := (page - 1) * limit
+	days, _ := strconv.Atoi(c.DefaultQuery("days", "0"))
 	folder, err := mail.NormalizeFolder(c.DefaultQuery("folder", mail.FolderAll))
 	if err != nil {
 		fail(c, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	// 优先使用 IMAP (App Password 认证)
-	var imapErr error
-	mc, err := s.mgr.MailClient(accountID)
-	if err == nil {
-		if connErr := mc.Connect(); connErr == nil {
-			defer mc.Disconnect()
-			var messages []mail.Message
-			if alias != "" {
-				messages, err = mc.FindByRecipientInFolder(alias, folder, limit, days)
-			} else {
-				messages, err = mc.ListMessages(folder, limit, days)
-			}
-			if err == nil {
+	cacheKey := ""
+	if alias != "" {
+		cacheKey = inboxCacheKey(accountID, alias, folder, limit, page, days)
+		forceRefresh := c.Query("refresh") == "1" || strings.EqualFold(c.Query("refresh"), "true")
+		if !forceRefresh {
+			if cachedMessages, cachedTotal, found := s.getInboxCache(cacheKey); found {
 				ok(c, gin.H{
-					"account_id": accountID,
-					"alias":      alias,
-					"folder":     folder,
-					"count":      len(messages),
-					"messages":   messages,
-					"method":     "imap",
+					"account_id":  accountID,
+					"alias":       alias,
+					"folder":      folder,
+					"page":        page,
+					"per_page":    limit,
+					"count":       len(cachedMessages),
+					"total":       cachedTotal,
+					"total_pages": totalPages(cachedTotal, limit),
+					"messages":    cachedMessages,
+					"method":      "imap_cache",
 				})
 				return
 			}
-			// IMAP 失败，继续尝试 Web API
-			imapErr = err
-		} else {
-			imapErr = connErr
 		}
+	}
+
+	// 优先使用 IMAP (App Password 认证)
+	var messages []mail.Message
+	var total int
+	var imapErr error
+	if alias != "" && folder == mail.FolderAll {
+		messages, total, imapErr = s.findAliasInAllFolders(accountID, alias, limit, offset, days)
 	} else {
-		imapErr = err
+		slot := "default"
+		if alias != "" {
+			slot = folder
+		}
+		imapErr = s.withMailClientSlot(accountID, slot, func(mc *mail.Client) error {
+			if alias != "" {
+				var queryErr error
+				messages, total, queryErr = mc.FindByRecipientPage(alias, folder, limit, offset, days)
+				return queryErr
+			}
+			fetched, queryErr := mc.ListMessages(folder, offset+limit, days)
+			if queryErr != nil {
+				return queryErr
+			}
+			total = len(fetched)
+			messages = pageMessages(fetched, offset, limit)
+			return nil
+		})
+	}
+	if imapErr == nil {
+		if cacheKey != "" {
+			s.setInboxCache(cacheKey, messages, total)
+		}
+		ok(c, gin.H{
+			"account_id":  accountID,
+			"alias":       alias,
+			"folder":      folder,
+			"page":        page,
+			"per_page":    limit,
+			"count":       len(messages),
+			"total":       total,
+			"total_pages": totalPages(total, limit),
+			"messages":    messages,
+			"method":      "imap",
+		})
+		return
 	}
 	if folder != mail.FolderInbox {
 		message := "查询全部邮件和垃圾邮件需要可用的 iCloud IMAP App Password"
@@ -415,33 +473,45 @@ func (s *Server) listInbox(c *gin.Context) {
 	}
 
 	if alias != "" {
-		messages, err := wmc.FindByAlias(alias, limit)
+		messages, err := wmc.FindByAlias(alias, offset+limit)
 		if err != nil {
 			fail(c, http.StatusFailedDependency, inboxClientError(imapErr, err))
 			return
 		}
 		setMessagesFolder(messages, mail.FolderInbox)
+		total := len(messages)
+		messages = pageMessages(messages, offset, limit)
 		ok(c, gin.H{
-			"account_id": accountID,
-			"alias":      alias,
-			"folder":     folder,
-			"count":      len(messages),
-			"messages":   messages,
-			"method":     "web_api",
+			"account_id":  accountID,
+			"alias":       alias,
+			"folder":      folder,
+			"page":        page,
+			"per_page":    limit,
+			"count":       len(messages),
+			"total":       total,
+			"total_pages": totalPages(total, limit),
+			"messages":    messages,
+			"method":      "web_api",
 		})
 	} else {
-		messages, err := wmc.ListInbox(limit)
+		messages, err := wmc.ListInbox(offset + limit)
 		if err != nil {
 			fail(c, http.StatusFailedDependency, inboxClientError(imapErr, err))
 			return
 		}
 		setMessagesFolder(messages, mail.FolderInbox)
+		total := len(messages)
+		messages = pageMessages(messages, offset, limit)
 		ok(c, gin.H{
-			"account_id": accountID,
-			"folder":     folder,
-			"count":      len(messages),
-			"messages":   messages,
-			"method":     "web_api",
+			"account_id":  accountID,
+			"folder":      folder,
+			"page":        page,
+			"per_page":    limit,
+			"count":       len(messages),
+			"total":       total,
+			"total_pages": totalPages(total, limit),
+			"messages":    messages,
+			"method":      "web_api",
 		})
 	}
 }
@@ -458,26 +528,23 @@ func (s *Server) getInboxMessage(c *gin.Context) {
 		return
 	}
 
-	var imapErr error
-	mc, err := s.mgr.MailClient(accountID)
-	if err == nil {
-		if connErr := mc.Connect(); connErr == nil {
-			defer mc.Disconnect()
-			full, err := mc.GetFullByID(messageID)
-			if err == nil {
-				ok(c, gin.H{
-					"account_id": accountID,
-					"message":    full,
-					"method":     "imap",
-				})
-				return
-			}
-			imapErr = err
-		} else {
-			imapErr = connErr
-		}
-	} else {
-		imapErr = err
+	var full *mail.FullMessage
+	slot := strings.ToLower(strings.TrimSpace(strings.SplitN(messageID, ":", 2)[0]))
+	if slot != mail.FolderInbox && slot != mail.FolderJunk {
+		slot = "default"
+	}
+	imapErr := s.withMailClientSlot(accountID, slot, func(mc *mail.Client) error {
+		var fetchErr error
+		full, fetchErr = mc.GetFullByID(messageID)
+		return fetchErr
+	})
+	if imapErr == nil {
+		ok(c, gin.H{
+			"account_id": accountID,
+			"message":    full,
+			"method":     "imap",
+		})
+		return
 	}
 
 	wmc, webErr := s.mgr.WebMailClient(accountID)
@@ -500,6 +567,24 @@ func setMessagesFolder(messages []mail.Message, folder string) {
 	for i := range messages {
 		messages[i].Folder = folder
 	}
+}
+
+func pageMessages(messages []mail.Message, offset, limit int) []mail.Message {
+	if offset >= len(messages) || limit <= 0 {
+		return []mail.Message{}
+	}
+	end := offset + limit
+	if end > len(messages) {
+		end = len(messages)
+	}
+	return messages[offset:end]
+}
+
+func totalPages(total, perPage int) int {
+	if total <= 0 || perPage <= 0 {
+		return 1
+	}
+	return (total + perPage - 1) / perPage
 }
 
 func inboxClientError(imapErr, webErr error) string {
@@ -527,7 +612,7 @@ func (s *Server) listAccounts(c *gin.Context) {
 }
 
 type addAccountReq struct {
-	Name    string `json:"name" binding:"required"`
+	Name    string `json:"name"`
 	Cookies string `json:"cookies" binding:"required"`
 	Host    string `json:"host"`
 	Proxy   string `json:"proxy"` // HTTP/SOCKS5 代理
@@ -536,7 +621,7 @@ type addAccountReq struct {
 func (s *Server) addAccount(c *gin.Context) {
 	var req addAccountReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, http.StatusBadRequest, "参数错误: name、cookies 必填 — "+err.Error())
+		fail(c, http.StatusBadRequest, "参数错误: cookies 必填 — "+err.Error())
 		return
 	}
 	acc, err := s.mgr.AddAccount(req.Name, req.Cookies, req.Host, req.Proxy)
@@ -558,6 +643,7 @@ func (s *Server) removeAccount(c *gin.Context) {
 		fail(c, http.StatusNotFound, "账号不存在")
 		return
 	}
+	s.closeIMAPSession(id)
 	ok(c, gin.H{"id": id})
 }
 
@@ -577,6 +663,7 @@ func (s *Server) setAppPassword(c *gin.Context) {
 		fail(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.closeIMAPSession(id)
 	ok(c, gin.H{"id": id, "icloud_email": req.ICloudEmail})
 }
 
@@ -720,5 +807,6 @@ func (s *Server) reloadConfig(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, "重新加载配置失败: "+err.Error())
 		return
 	}
+	s.closeAllIMAPSessions()
 	ok(c, gin.H{"message": "配置已重新加载"})
 }

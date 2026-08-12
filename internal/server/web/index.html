@@ -45,10 +45,6 @@
           <h1 id="page-title">账号</h1>
         </div>
         <div class="topbar-actions">
-          <label class="account-switcher" for="global-account-select">
-            <span>当前账号</span>
-            <select id="global-account-select" aria-label="当前账号"></select>
-          </label>
           <button class="icon-button" type="button" id="refresh-view" title="刷新当前页面" aria-label="刷新当前页面">
             <i data-lucide="refresh-cw"></i>
           </button>
@@ -99,7 +95,7 @@
 
         <section class="view" id="view-aliases" data-view="aliases" hidden>
           <div class="section-heading section-heading-sticky">
-            <div><h2>邮箱别名</h2><p id="aliases-summary">选择账号后加载</p></div>
+            <div><h2>邮箱别名</h2><p id="aliases-summary">加载所有账号的别名</p></div>
             <button class="button button-primary" type="button" data-action="create-alias" id="create-alias-button">
               <i data-lucide="plus"></i><span>领取别名</span>
             </button>
@@ -119,7 +115,7 @@
 
           <div class="table-shell" id="aliases-table-shell">
             <table>
-              <thead><tr><th>邮箱地址</th><th>状态</th><th>调用方使用记录</th><th>创建时间</th><th class="align-right">操作</th></tr></thead>
+              <thead><tr><th>邮箱地址</th><th>所属账号</th><th>状态</th><th>调用方使用记录</th><th>创建时间</th><th class="align-right">操作</th></tr></thead>
               <tbody id="aliases-body"></tbody>
             </table>
           </div>
@@ -132,26 +128,30 @@
 
         <section class="view" id="view-inbox" data-view="inbox" hidden>
           <div class="section-heading">
-            <div><h2>收件箱</h2><p id="inbox-summary">选择账号后查询</p></div>
+            <div><h2>收件箱</h2><p id="inbox-summary">所有账号的邮箱</p></div>
           </div>
 
-          <form class="inbox-filters" id="inbox-filter-form">
-            <label><span>邮箱别名</span><select id="inbox-alias"><option value="">全部邮件</option></select></label>
-            <div class="inbox-folder-control">
-              <span>邮件夹</span>
-              <div class="segmented-control" id="inbox-folder-filter" role="group" aria-label="邮件夹">
-                <button type="button" class="is-selected" data-inbox-folder="all">全部邮件</button>
-                <button type="button" data-inbox-folder="inbox">收件箱</button>
-                <button type="button" data-inbox-folder="junk">垃圾邮件</button>
-              </div>
-            </div>
-            <label><span>时间范围</span><select id="inbox-days"><option value="1">最近 1 天</option><option value="3">最近 3 天</option><option value="7" selected>最近 7 天</option><option value="30">最近 30 天</option></select></label>
-            <label><span>数量</span><select id="inbox-limit"><option value="10">10 封</option><option value="20" selected>20 封</option><option value="50">50 封</option><option value="100">100 封</option></select></label>
-            <button class="button button-primary" type="submit"><i data-lucide="search"></i><span>查询邮件</span></button>
-          </form>
-
           <div class="mail-layout">
-            <div class="mail-list" id="mail-list" aria-label="邮件列表"></div>
+            <aside class="mail-mailboxes" aria-label="邮箱列表">
+              <header class="mail-column-header"><strong>邮箱</strong><span id="mailbox-count">0</span></header>
+              <label class="mailbox-search" for="inbox-email-search">
+                <i data-lucide="search"></i>
+                <input id="inbox-email-search" type="search" placeholder="搜索邮箱" autocomplete="off">
+              </label>
+              <div class="mailbox-list" id="mailbox-list"></div>
+            </aside>
+            <section class="mail-messages" aria-label="邮件信封列表">
+              <header class="mail-column-header">
+                <button class="icon-button mobile-column-back" type="button" data-action="close-mailbox" title="返回邮箱列表" aria-label="返回邮箱列表"><i data-lucide="arrow-left"></i></button>
+                <strong id="message-list-title">邮件</strong><span id="message-count">0</span>
+              </header>
+              <div class="mail-list" id="mail-list"></div>
+              <nav class="mail-pagination" id="mail-pagination" aria-label="邮件分页" hidden>
+                <button class="icon-button" id="mail-page-prev" type="button" data-action="mail-page-prev" title="上一页" aria-label="上一页"><i data-lucide="chevron-left"></i></button>
+                <span id="mail-page-label">第 1 / 1 页</span>
+                <button class="icon-button" id="mail-page-next" type="button" data-action="mail-page-next" title="下一页" aria-label="下一页"><i data-lucide="chevron-right"></i></button>
+              </nav>
+            </section>
             <article class="mail-detail" id="mail-detail">
               <div class="mail-detail-empty">
                 <span class="empty-icon"><i data-lucide="mail-open"></i></span>
@@ -163,7 +163,7 @@
 
         <section class="view" id="view-settings" data-view="settings" hidden>
           <div class="section-heading">
-            <div><h2>重新登录与 OTP</h2><p id="settings-summary">读取当前服务配置</p></div>
+            <div><h2>服务配置</h2><p id="settings-summary">读取当前服务配置</p></div>
             <div class="command-row">
               <button class="button button-secondary" type="button" data-action="refresh-relogin-config">
                 <i data-lucide="refresh-cw"></i><span>刷新配置</span>
@@ -174,7 +174,14 @@
             </div>
           </div>
 
-          <div class="settings-grid" id="relogin-config-panel"></div>
+          <div class="settings-section">
+            <div class="settings-section-heading"><h3>自动创建别名</h3><p>控制后台别名池的创建节奏。</p></div>
+            <div class="settings-grid" id="alias-pool-config-panel"></div>
+          </div>
+          <div class="settings-section">
+            <div class="settings-section-heading"><h3>重新登录与 OTP</h3><p>管理 Apple 登录态恢复与验证码接收。</p></div>
+            <div class="settings-grid" id="relogin-config-panel"></div>
+          </div>
         </section>
       </div>
     </main>

@@ -7,7 +7,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o icloud-hme .
 
 FROM alpine:latest
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata && mkdir -p /app/config
 WORKDIR /app
 COPY --from=builder /build/icloud-hme .
 EXPOSE 8081

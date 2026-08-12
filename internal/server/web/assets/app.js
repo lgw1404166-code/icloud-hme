@@ -10,12 +10,19 @@
     aliases: [],
     messages: [],
     messageDetails: {},
+    aliasPoolConfig: { enabled: true, per_hour: 10, interval_seconds: 360, max_total: 0, label: "", note: "" },
+    aliasPoolLogs: [],
     reloginConfig: { enabled: false, manual_login_url: "https://account.apple.com/account/manage/section/privacy", otp: {} },
     inboxError: "",
-    selectedAccountId: localStorage.getItem("icloud-hme.selected-account") || "",
+    selectedMailboxKey: "",
     selectedMessageId: "",
     inboxRequestSeq: 0,
-    inboxFolder: "all",
+    inboxPage: 1,
+    inboxPageSize: 20,
+    inboxTotal: 0,
+    inboxTotalPages: 1,
+    inboxEmailSearch: "",
+    mailViewMode: "html",
     aliasFilter: "all",
     aliasSearch: "",
     aliasesLoadedFor: "",
@@ -23,6 +30,8 @@
     confirmSubmit: null,
     loginPrompted: {},
   };
+
+  let aliasesRequest = null;
 
   const viewMeta = {
     accounts: { title: "账号" },
@@ -68,7 +77,17 @@
       minute: "2-digit",
       second: "2-digit",
       hour12: false,
-    }).format(parsed).replaceAll("/", "-") + " 北京时间";
+    }).format(parsed).replaceAll("/", "-");
+  }
+
+  function sortableDate(value) {
+    if (!value) return Number.NEGATIVE_INFINITY;
+    if (typeof value === "number" || /^\d+$/.test(String(value))) {
+      const numeric = Number(value);
+      return numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
+    }
+    const timestamp = Date.parse(value);
+    return Number.isNaN(timestamp) ? Number.NEGATIVE_INFINITY : timestamp;
   }
 
   function folderLabel(folder) {
@@ -78,12 +97,12 @@
   }
 
   function accountInitial(account) {
-    const source = account.name || account.icloud_email || account.real_email || "IC";
+    const source = accountLabel(account);
     return [...source.trim()].slice(0, 2).join("").toUpperCase();
   }
 
-  function currentAccount() {
-    return state.accounts.find((account) => account.id === state.selectedAccountId) || null;
+  function accountLabel(account) {
+    return account?.icloud_email || account?.real_email || account?.id || "iCloud 账号";
   }
 
   async function request(path, options = {}) {
@@ -150,28 +169,6 @@
     button.classList.toggle("is-spinning", loading);
   }
 
-  function renderAccountSelect() {
-    const select = $("#global-account-select");
-    const previous = state.selectedAccountId;
-    if (!state.accounts.length) {
-      state.selectedAccountId = "";
-      select.innerHTML = `<option value="">暂无账号</option>`;
-      select.disabled = true;
-      localStorage.removeItem("icloud-hme.selected-account");
-      return;
-    }
-
-    if (!state.accounts.some((account) => account.id === previous)) {
-      state.selectedAccountId = state.accounts[0].id;
-    }
-    select.disabled = false;
-    select.innerHTML = state.accounts
-      .map((account) => `<option value="${escapeHTML(account.id)}">${escapeHTML(account.name || account.icloud_email || account.id)}</option>`)
-      .join("");
-    select.value = state.selectedAccountId;
-    localStorage.setItem("icloud-hme.selected-account", state.selectedAccountId);
-  }
-
   function accountStatus(account) {
     const status = String(account.status || "pending").toLowerCase();
     if (status === "active") return { label: "正常", className: "status-active" };
@@ -207,8 +204,8 @@
             <div class="cell-primary">
               <span class="account-avatar">${escapeHTML(accountInitial(account))}</span>
               <span class="cell-copy">
-                <strong>${escapeHTML(account.name || "未命名账号")}</strong>
-                <small>${escapeHTML(email)}</small>
+                <strong>${escapeHTML(accountLabel(account))}</strong>
+                <small>${escapeHTML(account.real_email && account.real_email !== accountLabel(account) ? account.real_email : account.host || "icloud.com")}</small>
               </span>
             </div>
           </td>
@@ -241,15 +238,13 @@
     try {
       state.accounts = (await request("/api/accounts")) || [];
       setServiceStatus(true);
-      renderAccountSelect();
       renderAccounts();
-      renderInboxAliasOptions();
+      renderMailboxList();
       maybePromptRelogin();
     } catch (error) {
       setServiceStatus(false);
       if (!silent) {
         state.accounts = [];
-        renderAccountSelect();
         renderAccounts();
       }
       toast(error.message, "error");
@@ -264,6 +259,23 @@
       state.reloginConfig = { enabled: false, manual_login_url: "https://account.apple.com/account/manage/section/privacy", otp: {} };
     }
     renderReloginConfig();
+  }
+
+  async function refreshAliasPoolConfig() {
+    const [configResult, logsResult] = await Promise.allSettled([
+      request("/api/alias-pool/config"),
+      request("/api/alias-pool/logs?limit=50"),
+    ]);
+    state.aliasPoolConfig = configResult.status === "fulfilled"
+      ? configResult.value
+      : { enabled: true, per_hour: 10, interval_seconds: 360, max_total: 0, label: "", note: "" };
+    state.aliasPoolLogs = logsResult.status === "fulfilled" ? (logsResult.value?.logs || []) : [];
+    renderAliasPoolConfig();
+  }
+
+  async function refreshSettings() {
+    await Promise.all([refreshAliasPoolConfig(), refreshReloginConfig()]);
+    updateSettingsSummary();
   }
 
   function formatDurationSeconds(seconds) {
@@ -287,6 +299,14 @@
 
   function reloginEnvTemplate() {
     return [
+      "# 后台别名池",
+      "ICLOUD_HME_AUTO_CREATE=true",
+      "ICLOUD_HME_AUTO_CREATE_PER_HOUR=10",
+      "ICLOUD_HME_AUTO_CREATE_INTERVAL=",
+      "ICLOUD_HME_AUTO_CREATE_MAX_TOTAL=0",
+      "ICLOUD_HME_AUTO_CREATE_LABEL=",
+      "ICLOUD_HME_AUTO_CREATE_NOTE=Created by icloud-hme alias pool",
+      "",
       "# 纯协议自动重新登录 + Android/SMSGate 验证码接收",
       "# 总开关关闭时，登录态过期仍走页面弹窗手动重新登录",
       "ICLOUD_HME_RELOGIN_ENABLED=false",
@@ -305,6 +325,71 @@
     return `<div class="config-row"><dt>${escapeHTML(label)}</dt><dd>${value}</dd></div>`;
   }
 
+  function updateSettingsSummary() {
+    const pool = state.aliasPoolConfig || {};
+    const relogin = state.reloginConfig || {};
+    const otpReady = Boolean(relogin.apple_id_configured && relogin.apple_password_configured && relogin.otp?.webhook_enabled);
+    $("#settings-summary").textContent = `自动创建：${pool.enabled ? `每小时 ${pool.per_hour || 10} 个` : "已关闭"} · 自动登录：${relogin.enabled ? (otpReady ? "已就绪" : "待补齐") : "已关闭"}`;
+  }
+
+  function renderAliasPoolConfig() {
+    const panel = $("#alias-pool-config-panel");
+    if (!panel) return;
+    const cfg = state.aliasPoolConfig || {};
+    const logs = state.aliasPoolLogs || [];
+    const logRows = logs.length ? logs.map((entry) => {
+      const level = entry.level || "info";
+      const levelLabel = level === "success" ? "成功" : level === "error" ? "失败" : level === "warning" ? "跳过" : "状态";
+      return `<div class="pool-log-row">
+        <time>${escapeHTML(formatDate(entry.time))}</time>
+        <span class="pool-log-level is-${escapeHTML(level)}">${levelLabel}</span>
+        <span class="pool-log-account">${escapeHTML(entry.account_email || "系统")}</span>
+        <span class="pool-log-message">${escapeHTML(entry.message || "-")}${entry.email ? ` · ${escapeHTML(entry.email)}` : ""}</span>
+      </div>`;
+    }).join("") : `<div class="pool-log-empty">本次运行暂无自动创建记录</div>`;
+    panel.innerHTML = `
+      <article class="config-card">
+        <header>
+          <span class="metric-icon ${cfg.enabled ? "tone-green" : "tone-amber"}"><i data-lucide="${cfg.enabled ? "circle-play" : "circle-pause"}"></i></span>
+          <div><h3>运行状态</h3><p>${cfg.enabled ? "后台任务会按当前频率为每个可用账号补充别名。" : "后台任务已停止，不会自动创建新别名。"}</p></div>
+        </header>
+        <dl class="config-list">
+          ${configRow("自动创建", configStatusBadge(Boolean(cfg.enabled), "已开启", "已关闭"))}
+          ${configRow("每小时频率", `<strong>${escapeHTML(cfg.per_hour || 10)} 个</strong>`)}
+          ${configRow("实际间隔", `<span>${escapeHTML(formatDurationSeconds(cfg.interval_seconds))}</span>`)}
+          ${configRow("单账号上限", `<span>${Number(cfg.max_total || 0) > 0 ? `${escapeHTML(cfg.max_total)} 个` : "不限"}</span>`)}
+        </dl>
+      </article>
+      <article class="config-card">
+        <header>
+          <span class="metric-icon tone-teal"><i data-lucide="timer-reset"></i></span>
+          <div><h3>创建频率</h3><p>留空自定义间隔时，系统按每小时频率自动计算。</p></div>
+        </header>
+        <form class="config-form" id="alias-pool-config-form">
+          <label class="field switch-field"><span>启用自动创建别名</span><input name="enabled" type="checkbox" ${cfg.enabled ? "checked" : ""}></label>
+          <div class="field-row">
+            <label class="field"><span>每小时创建数量</span><input name="per_hour" type="number" min="1" max="60" step="1" value="${escapeHTML(cfg.per_hour || 10)}" required></label>
+            <label class="field"><span>自定义间隔</span><input name="interval" autocomplete="off" placeholder="留空自动计算，例如 6m"></label>
+          </div>
+          <div class="field-row">
+            <label class="field"><span>单账号总量上限</span><input name="max_total" type="number" min="0" step="1" value="${escapeHTML(cfg.max_total || 0)}"><small>0 表示不限制。</small></label>
+            <label class="field"><span>固定标签</span><input name="label" value="${escapeHTML(cfg.label || "")}" autocomplete="off" placeholder="留空自动生成"></label>
+          </div>
+          <label class="field"><span>创建备注</span><input name="note" value="${escapeHTML(cfg.note || "")}" autocomplete="off"></label>
+          <div class="config-actions"><button class="button button-primary" type="submit" id="alias-pool-config-submit"><i data-lucide="save"></i><span>保存并立即应用</span></button></div>
+        </form>
+      </article>
+      <article class="config-card config-card-wide">
+        <header>
+          <span class="metric-icon tone-teal"><i data-lucide="scroll-text"></i></span>
+          <div><h3>自动创建日志</h3><p>最近 ${logs.length} 条，本次服务重启后产生。</p></div>
+        </header>
+        <div class="pool-log-list">${logRows}</div>
+      </article>`;
+    renderIcons(panel);
+    updateSettingsSummary();
+  }
+
   function renderReloginConfig() {
     const panel = $("#relogin-config-panel");
     if (!panel) return;
@@ -318,13 +403,6 @@
     const behavior = cfg.enabled
       ? (ready ? "纯协议自动流程已启用，OTP 由 webhook 接收。" : "纯协议自动流程已开启，但还有配置项待补齐。")
       : "总开关关闭，登录态过期时页面会弹窗并打开手动登录页。";
-
-    const summary = $("#settings-summary");
-    if (summary) {
-      summary.textContent = cfg.enabled
-        ? `自动重新登录：${ready ? "配置完整" : "待补齐"}`
-        : "自动重新登录关闭，使用手动登录弹窗";
-    }
 
     panel.innerHTML = `
       <article class="config-card">
@@ -415,13 +493,14 @@
       </article>
     `;
     renderIcons(panel);
+    updateSettingsSummary();
   }
 
   function maybePromptRelogin() {
     state.accounts.forEach((item) => {
       if (!item.requires_login) delete state.loginPrompted[item.id];
     });
-    const account = currentAccount() || state.accounts.find((item) => item.requires_login);
+    const account = state.accounts.find((item) => item.requires_login);
     if (!account || !account.requires_login || state.loginPrompted[account.id]) return;
     const dialog = $("#confirm-dialog");
     if (dialog?.open) return;
@@ -430,7 +509,7 @@
       const otpReady = Boolean(state.reloginConfig?.otp?.webhook_enabled);
       const credentialsReady = Boolean(state.reloginConfig?.apple_id_configured && state.reloginConfig?.apple_password_configured);
       if (otpReady && credentialsReady) {
-        toast(`${account.name || account.id} 登录态过期，已启用纯协议自动重新登录，等待 Apple 短信验证码。`);
+        toast(`${accountLabel(account)} 登录态过期，已启用纯协议自动重新登录，等待 Apple 短信验证码。`);
       } else {
         toast(`已开启纯协议自动重新登录，但配置未完整：Apple 账号密码=${credentialsReady ? "已配置" : "未配置"}，OTP webhook=${otpReady ? "已配置" : "未配置"}`, "error");
       }
@@ -438,7 +517,7 @@
     }
     openConfirm({
       title: "需要重新登录 Apple",
-      message: `${account.name || account.id} 的 Apple 账户登录态已过期。点击确定后会打开官方隐私邮箱页面，登录完成后请回到本页面更新 Cookie。`,
+      message: `${accountLabel(account)} 的 Apple 账户登录态已过期。点击确定后会打开官方隐私邮箱页面，登录完成后请回到本页面更新 Cookie。`,
       submitLabel: "打开登录页",
       onSubmit: async () => {
         window.open(state.reloginConfig?.manual_login_url || "https://account.apple.com/account/manage/section/privacy", "icloud_hme_relogin", "popup,width=1120,height=820");
@@ -452,7 +531,7 @@
       const statusMatch = state.aliasFilter === "all"
         || (state.aliasFilter === "active" && alias.active)
         || (state.aliasFilter === "inactive" && !alias.active);
-      const searchMatch = !search || `${alias.email || ""} ${(alias.used_by || []).join(" ")}`.toLowerCase().includes(search);
+      const searchMatch = !search || `${alias.email || ""} ${alias.account_email || ""} ${(alias.used_by || []).join(" ")}`.toLowerCase().includes(search);
       return statusMatch && searchMatch;
     });
   }
@@ -461,13 +540,10 @@
     const body = $("#aliases-body");
     const shell = $("#aliases-table-shell");
     const empty = $("#aliases-empty");
-    const account = currentAccount();
     const aliases = filteredAliases();
-    $("#create-alias-button").disabled = !account;
+    $("#create-alias-button").disabled = state.accounts.length === 0;
     const activeCount = state.aliases.filter((alias) => alias.active).length;
-    $("#aliases-summary").textContent = account
-      ? `${account.name || account.id} · ${activeCount} 个有效 / ${state.aliases.length} 个别名`
-      : "选择账号后加载";
+    $("#aliases-summary").textContent = `${state.accounts.length} 个账号 · ${activeCount} 个有效 / ${state.aliases.length} 个别名`;
 
     shell.hidden = aliases.length === 0;
     empty.hidden = aliases.length > 0;
@@ -481,13 +557,14 @@
             <button class="copy-button" type="button" data-action="copy-email" data-email="${escapeHTML(alias.email)}" title="复制邮箱" aria-label="复制邮箱"><i data-lucide="copy"></i></button>
           </div>
         </td>
+        <td data-label="所属账号"><span class="cell-secondary account-email">${escapeHTML(alias.account_email || alias.account_id)}</span></td>
         <td data-label="状态"><span class="status-badge ${alias.active ? "status-active" : "status-inactive"}">${alias.active ? "使用中" : "已停用"}</span></td>
         <td data-label="调用方使用记录"><span class="cell-secondary">${escapeHTML((alias.used_by || []).join("、") || "尚未领取")}</span></td>
         <td data-label="创建时间"><span class="cell-secondary">${escapeHTML(formatDate(alias.createdAt))}</span></td>
         <td data-label="操作" class="align-right">
           <div class="row-actions">
-            <button class="icon-button" type="button" data-action="toggle-alias" data-id="${escapeHTML(alias.anonymousId)}" data-active="${alias.active}" title="${alias.active ? "停用别名" : "激活别名"}" aria-label="${alias.active ? "停用别名" : "激活别名"}"><i data-lucide="${alias.active ? "power-off" : "power"}"></i></button>
-            <button class="icon-button is-danger" type="button" data-action="delete-alias" data-id="${escapeHTML(alias.anonymousId)}" data-email="${escapeHTML(alias.email)}" title="删除别名" aria-label="删除别名"><i data-lucide="trash-2"></i></button>
+            <button class="icon-button" type="button" data-action="toggle-alias" data-id="${escapeHTML(alias.anonymousId)}" data-account-id="${escapeHTML(alias.account_id)}" data-active="${alias.active}" title="${alias.active ? "停用别名" : "激活别名"}" aria-label="${alias.active ? "停用别名" : "激活别名"}"><i data-lucide="${alias.active ? "power-off" : "power"}"></i></button>
+            <button class="icon-button is-danger" type="button" data-action="delete-alias" data-id="${escapeHTML(alias.anonymousId)}" data-account-id="${escapeHTML(alias.account_id)}" data-email="${escapeHTML(alias.email)}" title="删除别名" aria-label="删除别名"><i data-lucide="trash-2"></i></button>
           </div>
         </td>
       </tr>`).join("");
@@ -497,7 +574,7 @@
   function renderAliasesLoading() {
     $("#aliases-empty").hidden = true;
     $("#aliases-table-shell").hidden = false;
-    $("#aliases-body").innerHTML = `<tr><td colspan="5"><div class="loading-state"><i data-lucide="loader-circle"></i><span>同步 iCloud 别名</span></div></td></tr>`;
+    $("#aliases-body").innerHTML = `<tr><td colspan="6"><div class="loading-state"><i data-lucide="loader-circle"></i><span>同步所有账号的 iCloud 别名</span></div></td></tr>`;
     renderIcons($("#aliases-body"));
   }
 
@@ -511,61 +588,198 @@
   }
 
   async function refreshAliases({ force = false } = {}) {
-    const account = currentAccount();
-    if (!account) {
+    if (!state.accounts.length) {
       state.aliases = [];
       state.aliasesLoadedFor = "";
       renderAliases();
-      renderInboxAliasOptions();
+      renderMailboxList();
       return;
     }
-    if (!force && state.aliasesLoadedFor === account.id) {
+    if (!force && state.aliasesLoadedFor === "all") {
       renderAliases();
+      renderMailboxList();
       return;
     }
 
-    renderAliasesLoading();
+    if (aliasesRequest) return aliasesRequest;
+    aliasesRequest = refreshAliasesFromServer();
     try {
+      await aliasesRequest;
+    } finally {
+      aliasesRequest = null;
+    }
+  }
+
+  async function refreshAliasesFromServer() {
+    renderAliasesLoading();
+    const results = await Promise.allSettled(state.accounts.map(async (account) => {
       const data = await request(`/api/aliases?account_id=${encodeURIComponent(account.id)}`);
-      state.aliases = data?.aliases || [];
-      state.aliasesLoadedFor = account.id;
-      updateAccountAliasStats(account.id, state.aliases);
-      renderAliases();
-      renderInboxAliasOptions();
-    } catch (error) {
-      state.aliases = [];
-      state.aliasesLoadedFor = account.id;
-      renderAliases();
-      renderInboxAliasOptions();
-      toast(error.message, "error");
-      if (error.status === 401) {
+      return {
+        account,
+        aliases: (data?.aliases || []).map((alias) => ({
+          ...alias,
+          account_id: account.id,
+          account_email: accountLabel(account),
+        })),
+      };
+    }));
+    const failures = [];
+    const aliases = [];
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        aliases.push(...result.value.aliases);
+        updateAccountAliasStats(result.value.account.id, result.value.aliases);
+      } else {
+        failures.push(`${accountLabel(state.accounts[index])}: ${result.reason?.message || "同步失败"}`);
+      }
+    });
+    state.aliases = aliases.sort((left, right) => sortableDate(right.createdAt) - sortableDate(left.createdAt)
+      || (left.account_email || "").localeCompare(right.account_email || "")
+      || (left.email || "").localeCompare(right.email || ""));
+    state.aliasesLoadedFor = "all";
+    renderAliases();
+    renderMailboxList();
+    if (failures.length) {
+      toast(`${failures.length} 个账号同步失败：${failures.join("；")}`, "error");
+      if (results.some((result) => result.status === "rejected" && result.reason?.status === 401)) {
         await refreshAccounts({ silent: true });
       }
     }
   }
 
-  function renderInboxAliasOptions() {
-    const select = $("#inbox-alias");
-    const previous = select.value;
-    select.innerHTML = `<option value="">全部邮件</option>${state.aliases
-      .map((alias) => `<option value="${escapeHTML(alias.email)}">${escapeHTML(alias.label ? `${alias.label} · ${alias.email}` : alias.email)}</option>`)
-      .join("")}`;
-    if ([...select.options].some((option) => option.value === previous)) select.value = previous;
-    select.disabled = !currentAccount();
+  function mailboxKey(accountId, email) {
+    return `${accountId}:${String(email || "").toLowerCase()}`;
+  }
+
+  function selectedMailbox() {
+    return state.aliases.find((alias) => mailboxKey(alias.account_id, alias.email) === state.selectedMailboxKey) || null;
+  }
+
+  function filteredMailboxes() {
+    const search = state.inboxEmailSearch.trim().toLowerCase();
+    return state.aliases.filter((alias) => !search || `${alias.email || ""} ${alias.account_email || ""} ${alias.label || ""}`.toLowerCase().includes(search));
+  }
+
+  function renderMailboxList() {
+    const list = $("#mailbox-list");
+    if (!list) return;
+    const mailboxes = filteredMailboxes();
+    $(".mail-layout")?.classList.toggle("has-mailbox", Boolean(selectedMailbox()));
+    $("#mailbox-count").textContent = String(mailboxes.length);
+    if (!mailboxes.length) {
+      list.innerHTML = `<div class="mail-column-empty"><i data-lucide="at-sign"></i><span>${state.aliases.length ? "没有匹配的邮箱" : "暂无邮箱"}</span></div>`;
+      renderIcons(list);
+      return;
+    }
+    list.innerHTML = mailboxes.map((alias) => {
+      const key = mailboxKey(alias.account_id, alias.email);
+      return `<button class="mailbox-item${key === state.selectedMailboxKey ? " is-selected" : ""}" type="button" data-action="select-mailbox" data-account-id="${escapeHTML(alias.account_id)}" data-email="${escapeHTML(alias.email)}">
+        <span class="mailbox-icon"><i data-lucide="mail"></i></span>
+        <span class="mailbox-copy"><strong>${escapeHTML(alias.email)}</strong><small>${escapeHTML(alias.account_email || alias.account_id)}</small></span>
+        <span class="mailbox-status${alias.active ? "" : " is-inactive"}" title="${alias.active ? "使用中" : "已停用"}"></span>
+      </button>`;
+    }).join("");
+    renderIcons(list);
+  }
+
+  function selectMailbox(accountId, email) {
+    const key = mailboxKey(accountId, email);
+    if (key === state.selectedMailboxKey) return false;
+    state.selectedMailboxKey = key;
+    state.messages = [];
+    state.messageDetails = {};
+    state.inboxError = "";
+    state.selectedMessageId = "";
+    state.inboxPage = 1;
+    state.inboxTotal = 0;
+    state.inboxTotalPages = 1;
+    state.mailViewMode = "html";
+    state.inboxRequestSeq++;
+    renderMailboxList();
+    renderMessages();
+    return true;
+  }
+
+  function buildMailDocument(rawHTML) {
+    const parsed = new DOMParser().parseFromString(String(rawHTML || ""), "text/html");
+    parsed.querySelectorAll("script, iframe, object, embed, meta[http-equiv]").forEach((node) => node.remove());
+    parsed.querySelectorAll("*").forEach((node) => {
+      [...node.attributes].forEach((attribute) => {
+        const name = attribute.name.toLowerCase();
+        const value = attribute.value.trim().toLowerCase();
+        if (name.startsWith("on") || (["href", "src", "action", "formaction", "xlink:href"].includes(name) && value.startsWith("javascript:"))) {
+          node.removeAttribute(attribute.name);
+        }
+      });
+    });
+    parsed.querySelectorAll("base").forEach((node) => node.remove());
+    parsed.querySelectorAll("img").forEach((image) => {
+      const lazySource = image.getAttribute("data-src")
+        || image.getAttribute("data-original")
+        || image.getAttribute("data-lazy-src")
+        || image.getAttribute("data-original-src");
+      if ((!image.getAttribute("src") || image.getAttribute("src") === "about:blank") && lazySource) {
+        image.setAttribute("src", lazySource);
+      }
+      if (!image.getAttribute("src") && image.getAttribute("srcset")) {
+        const firstCandidate = image.getAttribute("srcset").split(",")[0].trim().split(/\s+/)[0];
+        if (firstCandidate) image.setAttribute("src", firstCandidate);
+      }
+      image.setAttribute("loading", "eager");
+      image.setAttribute("referrerpolicy", "no-referrer");
+    });
+    const base = parsed.createElement("base");
+    base.target = "_blank";
+    parsed.head.prepend(base);
+    if (!parsed.querySelector("meta[name='viewport']")) {
+      const viewport = parsed.createElement("meta");
+      viewport.name = "viewport";
+      viewport.content = "width=device-width, initial-scale=1";
+      parsed.head.append(viewport);
+    }
+    const style = parsed.createElement("style");
+    style.textContent = `
+      html, body { min-height: 100%; margin: 0; background: #fff; color: #18211f; }
+      body { box-sizing: border-box; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow-wrap: anywhere; }
+      img, video, table { max-width: 100% !important; }
+      img, video { height: auto !important; }
+      pre { max-width: 100%; overflow: auto; white-space: pre-wrap; }
+      a { color: #1f6b5b; }
+    `;
+    parsed.head.append(style);
+    return `<!doctype html>${parsed.documentElement.outerHTML}`;
+  }
+
+  function writeMailFrame(html) {
+    const frame = $("#mail-html-frame");
+    if (!frame) return;
+    const doc = frame.contentDocument || frame.contentWindow?.document;
+    if (!doc) return;
+    doc.open();
+    doc.write(buildMailDocument(html));
+    doc.close();
   }
 
   function renderMailDetail(message) {
     const detail = $("#mail-detail");
     if (!message) {
       detail.classList.remove("is-open");
+      $(".mail-layout")?.classList.remove("has-message");
       detail.innerHTML = `<div class="mail-detail-empty"><span class="empty-icon"><i data-lucide="mail-open"></i></span><h3>选择一封邮件</h3></div>`;
       renderIcons(detail);
       return;
     }
 
-    const htmlBody = message.html ? `
-          <iframe class="mail-html-frame" sandbox srcdoc="${escapeHTML(message.html)}"></iframe>` : "";
-    const textBody = !message.html ? `<div class="mail-content">${escapeHTML(message.body || message.preview || "无正文内容")}</div>` : "";
+    const mailbox = selectedMailbox();
+    const hasHTML = Boolean(String(message.html || "").trim());
+    if (!hasHTML) state.mailViewMode = "text";
+    const showHTML = hasHTML && state.mailViewMode === "html";
+    const viewToggle = hasHTML && String(message.body || "").trim() ? `<div class="mail-view-toggle segmented-control" role="group" aria-label="正文格式">
+      <button type="button" class="${showHTML ? "is-selected" : ""}" data-action="set-mail-view" data-mode="html">HTML</button>
+      <button type="button" class="${showHTML ? "" : "is-selected"}" data-action="set-mail-view" data-mode="text">纯文本</button>
+    </div>` : "";
+    const htmlBody = showHTML ? `<iframe id="mail-html-frame" class="mail-html-frame" title="邮件正文" sandbox="allow-same-origin allow-popups"></iframe>` : "";
+    const textBody = !showHTML ? `<div class="mail-content">${escapeHTML(message.body || message.preview || "无正文内容")}</div>` : "";
     detail.innerHTML = `
       <div class="mail-detail-content">
         <button class="icon-button mail-detail-close" type="button" data-action="close-message" title="返回邮件列表" aria-label="返回邮件列表"><i data-lucide="arrow-left"></i></button>
@@ -575,14 +789,17 @@
             <dt>发件人</dt><dd>${escapeHTML(message.from || "-")}</dd>
             <dt>收件人</dt><dd>${escapeHTML(message.to || "-")}</dd>
             <dt>时间</dt><dd>${escapeHTML(formatDate(message.date, message.date || "-"))}</dd>
+            <dt>所属账号</dt><dd>${escapeHTML(mailbox?.account_email || mailbox?.account_id || "-")}</dd>
             <dt>邮件夹</dt><dd>${escapeHTML(folderLabel(message.folder || "inbox"))}</dd>
-            <dt>ID</dt><dd>${escapeHTML(message.id || "-")}</dd>
           </dl>
         </header>
-        ${htmlBody || textBody}
+        ${viewToggle}
+        <div class="mail-body-shell">${htmlBody || textBody}</div>
       </div>`;
     detail.classList.add("is-open");
+    $(".mail-layout")?.classList.add("has-message");
     renderIcons(detail);
+    if (showHTML) writeMailFrame(message.html);
   }
 
   function renderMailDetailLoading() {
@@ -594,10 +811,21 @@
 
   function renderMessages() {
     const list = $("#mail-list");
-    const account = currentAccount();
-    $("#inbox-summary").textContent = account
-      ? `${account.name || account.id} · ${state.messages.length} 封邮件`
-      : "选择账号后查询";
+    const mailbox = selectedMailbox();
+    $(".mail-layout")?.classList.toggle("has-mailbox", Boolean(mailbox));
+    $("#message-count").textContent = String(state.inboxTotal);
+    $("#message-list-title").textContent = mailbox ? mailbox.email : "邮件";
+    $("#inbox-summary").textContent = mailbox
+      ? `主账号：${mailbox.account_email || mailbox.account_id} ｜ 别名邮箱：${mailbox.email} ｜ 全部邮件：共 ${state.inboxTotal} 封`
+      : `邮箱总数：${state.aliases.length} ｜ 请选择邮箱`;
+    renderMailPagination();
+
+    if (!mailbox) {
+      list.innerHTML = `<div class="mail-empty-list"><span class="empty-icon"><i data-lucide="panel-left"></i></span><strong>选择一个邮箱</strong></div>`;
+      renderMailDetail(null);
+      renderIcons(list);
+      return;
+    }
 
     if (!state.messages.length) {
       if (state.inboxError) {
@@ -612,22 +840,36 @@
 
     list.innerHTML = state.messages.map((message) => `
       <button class="mail-item${message.id === state.selectedMessageId ? " is-selected" : ""}" type="button" data-action="select-message" data-id="${escapeHTML(message.id)}">
-        <span class="mail-item-head"><strong>${escapeHTML(message.from || "未知发件人")}</strong><span class="mail-item-meta"><span class="mail-folder-badge${message.folder === "junk" ? " is-junk" : ""}">${escapeHTML(folderLabel(message.folder || "inbox"))}</span><time>${escapeHTML(formatDate(message.date))}</time></span></span>
+        <span class="mail-item-head"><strong>${escapeHTML(message.from || "未知发件人")}</strong><time>${escapeHTML(formatDate(message.date))}</time></span>
         <span class="mail-subject">${escapeHTML(message.subject || "无主题")}</span>
+        <span class="mail-preview">${escapeHTML(message.preview || "邮件信封")}</span>
       </button>`).join("");
     if (!state.selectedMessageId) renderMailDetail(null);
   }
 
+  function renderMailPagination() {
+    const pagination = $("#mail-pagination");
+    if (!pagination) return;
+    pagination.hidden = !selectedMailbox() || state.inboxTotalPages <= 1;
+    $("#mail-page-label").textContent = `第 ${state.inboxPage} / ${state.inboxTotalPages} 页`;
+    $("#mail-page-prev").disabled = state.inboxPage <= 1;
+    $("#mail-page-next").disabled = state.inboxPage >= state.inboxTotalPages;
+    if (!pagination.hidden) renderIcons(pagination);
+  }
+
   function renderMessagesLoading() {
     $("#mail-list").innerHTML = `<div class="loading-state"><i data-lucide="loader-circle"></i><span>读取邮件</span></div>`;
+    $("#message-count").textContent = "-";
     renderMailDetail(null);
     renderIcons($("#mail-list"));
   }
 
-  async function refreshInbox() {
-    const account = currentAccount();
-    if (!account) {
+  async function refreshInbox({ force = false } = {}) {
+    const mailbox = selectedMailbox();
+    if (!mailbox) {
       state.messages = [];
+      state.inboxTotal = 0;
+      state.inboxTotalPages = 1;
       state.inboxError = "";
       renderMessages();
       return;
@@ -635,52 +877,60 @@
     state.inboxError = "";
     renderMessagesLoading();
     const requestSeq = ++state.inboxRequestSeq;
-    const requestAccountId = account.id;
+    const requestMailboxKey = state.selectedMailboxKey;
     const params = new URLSearchParams({
-      account_id: account.id,
-      folder: state.inboxFolder,
-      limit: $("#inbox-limit").value,
-      days: $("#inbox-days").value,
+      account_id: mailbox.account_id,
+      alias: mailbox.email,
+      folder: "all",
+      limit: String(state.inboxPageSize),
+      days: "0",
+      page: String(state.inboxPage),
     });
-    const alias = $("#inbox-alias").value;
-    if (alias) params.set("alias", alias);
+    if (force) params.set("refresh", "1");
     try {
       const data = await request(`/api/inbox?${params}`);
-      if (requestSeq !== state.inboxRequestSeq || state.selectedAccountId !== requestAccountId) return;
+      if (requestSeq !== state.inboxRequestSeq || state.selectedMailboxKey !== requestMailboxKey) return;
       state.messages = data?.messages || [];
+      state.inboxTotal = Number(data?.total ?? state.messages.length);
+      state.inboxTotalPages = Math.max(1, Number(data?.total_pages || Math.ceil(state.inboxTotal / state.inboxPageSize) || 1));
+      state.inboxPage = Math.min(state.inboxPage, state.inboxTotalPages);
       state.inboxError = "";
       state.selectedMessageId = "";
       state.messageDetails = {};
       renderMessages();
-      $("#inbox-summary").textContent = `${account.name || account.id} · ${folderLabel(data?.folder || state.inboxFolder)} · ${state.messages.length} 封邮件 · ${data?.method === "imap" ? "IMAP" : "Web API"}`;
+      $("#inbox-summary").textContent = `主账号：${mailbox.account_email || mailbox.account_id} ｜ 别名邮箱：${mailbox.email} ｜ 全部邮件：共 ${state.inboxTotal} 封`;
     } catch (error) {
-      if (requestSeq !== state.inboxRequestSeq || state.selectedAccountId !== requestAccountId) return;
+      if (requestSeq !== state.inboxRequestSeq || state.selectedMailboxKey !== requestMailboxKey) return;
       state.messages = [];
+      state.inboxTotal = 0;
+      state.inboxTotalPages = 1;
       state.inboxError = error.message;
       renderMessages();
     }
   }
 
   async function loadMessageDetail(messageId) {
-    const account = currentAccount();
-    if (!account || !messageId) return;
+    const mailbox = selectedMailbox();
+    if (!mailbox || !messageId) return;
     state.selectedMessageId = messageId;
+    state.mailViewMode = "html";
     renderMessages();
-    if (state.messageDetails[messageId]) {
-      renderMailDetail(state.messageDetails[messageId]);
+    const detailKey = `${state.selectedMailboxKey}:${messageId}`;
+    if (state.messageDetails[detailKey]) {
+      renderMailDetail(state.messageDetails[detailKey]);
       return;
     }
     renderMailDetailLoading();
-    const requestAccountId = account.id;
-    const params = new URLSearchParams({ account_id: account.id, id: messageId });
+    const requestMailboxKey = state.selectedMailboxKey;
+    const params = new URLSearchParams({ account_id: mailbox.account_id, id: messageId });
     try {
       const data = await request(`/api/inbox/message?${params}`);
-      if (state.selectedAccountId !== requestAccountId || state.selectedMessageId !== messageId) return;
+      if (state.selectedMailboxKey !== requestMailboxKey || state.selectedMessageId !== messageId) return;
       const message = data?.message || {};
-      state.messageDetails[messageId] = message;
+      state.messageDetails[detailKey] = message;
       renderMailDetail(message);
     } catch (error) {
-      if (state.selectedAccountId !== requestAccountId || state.selectedMessageId !== messageId) return;
+      if (state.selectedMailboxKey !== requestMailboxKey || state.selectedMessageId !== messageId) return;
       renderMailDetail({
         id: messageId,
         subject: "正文加载失败",
@@ -698,8 +948,8 @@
     try {
       if (state.view === "accounts") await refreshAccounts({ silent: true });
       if (state.view === "aliases") await refreshAliases({ force: true });
-      if (state.view === "inbox") await refreshInbox();
-      if (state.view === "settings") await refreshReloginConfig();
+      if (state.view === "inbox") await refreshInbox({ force: true });
+      if (state.view === "settings") await refreshSettings();
     } finally {
       setRefreshLoading(false);
     }
@@ -723,10 +973,11 @@
 
     if (view === "aliases") await refreshAliases();
     if (view === "inbox") {
-      void refreshAliases();
+      await refreshAliases();
+      renderMailboxList();
       await refreshInbox();
     }
-    if (view === "settings") await refreshReloginConfig();
+    if (view === "settings") await refreshSettings();
   }
 
   function editorError(message = "") {
@@ -778,10 +1029,9 @@
       submitLabel: "创建账号",
       body: `
         <div class="field-row">
-          <label class="field"><span>账号名称</span><input name="name" required maxlength="80" autocomplete="off"></label>
           <label class="field"><span>iCloud 区域</span><select name="host"><option value="icloud.com">icloud.com</option><option value="icloud.com.cn">icloud.com.cn</option></select></label>
+          <label class="field"><span>代理地址</span><input name="proxy" placeholder="可选" autocomplete="off"></label>
         </div>
-        <label class="field"><span>代理地址</span><input name="proxy" placeholder="http://user:pass@host:port" autocomplete="off"></label>
         <label class="field"><span>Cookie</span><textarea name="cookies" required placeholder="JSON、浏览器导出数组或 Cookie Header" spellcheck="false"></textarea><small>请导入 icloud.com 及 account.apple.com / appleid.apple.com 的登录 Cookie；包含 Apple 账户 Cookie 时，创建别名会使用与官网一致的账户管理接口。</small></label>`,
       onSubmit: async (form) => {
         const data = new FormData(form);
@@ -789,13 +1039,11 @@
         const account = await request("/api/accounts", {
           method: "POST",
           body: JSON.stringify({
-            name: String(data.get("name") || "").trim(),
             host: String(data.get("host") || "icloud.com"),
             proxy: String(data.get("proxy") || "").trim(),
             cookies,
           }),
         });
-        state.selectedAccountId = account.id;
         closeEditor();
         await refreshAccounts({ silent: true });
         toast(account.status === "active" ? "账号已添加并验证" : "账号已添加，但 Cookie 校验失败");
@@ -827,7 +1075,7 @@
   function openCookieEditor(account) {
     if (!account) return;
     openEditor({
-      eyebrow: account.name || "账号",
+      eyebrow: accountLabel(account),
       title: "更新 Cookie",
       submitLabel: "验证并保存",
       body: `<label class="field"><span>Cookie</span><textarea name="cookies" required placeholder="JSON、浏览器导出数组或 Cookie Header" spellcheck="false"></textarea><small>同时导入 icloud.com 与 account.apple.com / appleid.apple.com Cookie，可启用官网创建协议。</small></label>`,
@@ -848,7 +1096,7 @@
   function openPasswordEditor(account) {
     if (!account) return;
     openEditor({
-      eyebrow: account.name || "账号",
+      eyebrow: accountLabel(account),
       title: "设置 App Password",
       submitLabel: "验证并保存",
       body: `
@@ -871,21 +1119,25 @@
   }
 
   function openCreateAlias() {
-    const account = currentAccount();
-    if (!account) return toast("请先选择账号", "error");
+    if (!state.accounts.length) return toast("请先添加账号", "error");
+    const accountOptions = state.accounts
+      .map((account) => `<option value="${escapeHTML(account.id)}">${escapeHTML(accountLabel(account))}</option>`)
+      .join("");
     openEditor({
-      eyebrow: account.name || "账号",
+      eyebrow: "所有账号",
       title: "领取池中别名",
       submitLabel: "领取别名",
       body: `
+        <label class="field"><span>所属账号</span><select name="account_id" required>${accountOptions}</select></label>
         <label class="field"><span>调用方身份</span><input name="caller" maxlength="80" autocomplete="off" placeholder="例如 chatgpt、moxt" required></label>
         <p class="field-help">这里从后台定时创建的本地别名池领取邮箱，不触发 Apple 创建请求；同一调用方不会重复拿到已领取过的邮箱。</p>`,
       onSubmit: async (form) => {
         const data = new FormData(form);
+        const accountId = String(data.get("account_id") || "");
         const caller = String(data.get("caller") || "").trim();
         const result = await request("/api/create", {
           method: "POST",
-          body: JSON.stringify({ account_id: account.id, caller }),
+          body: JSON.stringify({ account_id: accountId, caller }),
         });
         closeEditor();
         state.aliasesLoadedFor = "";
@@ -947,15 +1199,41 @@
     }
   }
 
+  async function saveAliasPoolConfig(form) {
+    const data = new FormData(form);
+    const body = {
+      enabled: data.get("enabled") === "on",
+      per_hour: Number(data.get("per_hour") || 10),
+      interval: String(data.get("interval") || "").trim(),
+      max_total: Number(data.get("max_total") || 0),
+      label: String(data.get("label") || "").trim(),
+      note: String(data.get("note") || "").trim(),
+    };
+    const submit = $("#alias-pool-config-submit", form);
+    setButtonLoading(submit, true);
+    try {
+      state.aliasPoolConfig = await request("/api/alias-pool/config", {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      const logData = await request("/api/alias-pool/logs?limit=50");
+      state.aliasPoolLogs = logData?.logs || [];
+      renderAliasPoolConfig();
+      toast("自动创建配置已保存并立即应用");
+    } finally {
+      setButtonLoading(submit, false);
+    }
+  }
+
   async function toggleAlias(button) {
-    const account = currentAccount();
-    if (!account) return;
+    const accountId = button.dataset.accountId;
+    if (!accountId) return;
     const active = button.dataset.active === "true";
     setButtonLoading(button, true);
     try {
       await request(`/api/aliases/${encodeURIComponent(button.dataset.id)}/${active ? "deactivate" : "reactivate"}`, {
         method: "POST",
-        body: JSON.stringify({ account_id: account.id }),
+        body: JSON.stringify({ account_id: accountId }),
       });
       state.aliasesLoadedFor = "";
       await refreshAliases({ force: true });
@@ -968,8 +1246,8 @@
   }
 
   function deleteAlias(button) {
-    const account = currentAccount();
-    if (!account) return;
+    const accountId = button.dataset.accountId;
+    if (!accountId) return;
     openConfirm({
       title: "删除邮箱别名",
       message: `删除 ${button.dataset.email || "该别名"} 后无法恢复。`,
@@ -977,7 +1255,7 @@
       onSubmit: async () => {
         await request(`/api/aliases/${encodeURIComponent(button.dataset.id)}`, {
           method: "DELETE",
-          body: JSON.stringify({ account_id: account.id }),
+          body: JSON.stringify({ account_id: accountId }),
         });
         state.aliasesLoadedFor = "";
         await refreshAliases({ force: true });
@@ -991,7 +1269,7 @@
     if (!account) return;
     openConfirm({
       title: "删除账号",
-      message: `删除 ${account.name || account.id} 后，本机保存的该账号认证信息将被移除。`,
+      message: `删除 ${accountLabel(account)} 后，本机保存的该账号认证信息将被移除。`,
       submitLabel: "删除账号",
       onSubmit: async () => {
         await request(`/api/accounts/${encodeURIComponent(account.id)}`, { method: "DELETE" });
@@ -999,6 +1277,9 @@
         state.messages = [];
         state.messageDetails = {};
         state.inboxError = "";
+        state.inboxPage = 1;
+        state.inboxTotal = 0;
+        state.inboxTotalPages = 1;
         state.aliasesLoadedFor = "";
         await refreshAccounts({ silent: true });
         renderAliases();
@@ -1006,20 +1287,6 @@
         toast("账号已删除");
       },
     });
-  }
-
-  function selectAccount(id) {
-    if (id === state.selectedAccountId) return;
-    state.selectedAccountId = id;
-    localStorage.setItem("icloud-hme.selected-account", id);
-    state.aliases = [];
-    state.messages = [];
-    state.messageDetails = {};
-    state.inboxError = "";
-    state.inboxRequestSeq++;
-    state.aliasesLoadedFor = "";
-    state.selectedMessageId = "";
-    renderInboxAliasOptions();
   }
 
   function bindEvents() {
@@ -1031,14 +1298,6 @@
       if (event.target.closest("[data-confirm-cancel]")) {
         $("#confirm-dialog").close();
         state.confirmSubmit = null;
-        return;
-      }
-
-      const inboxFolder = event.target.closest("[data-inbox-folder]");
-      if (inboxFolder) {
-        state.inboxFolder = inboxFolder.dataset.inboxFolder;
-        $$('[data-inbox-folder]').forEach((button) => button.classList.toggle("is-selected", button === inboxFolder));
-        if (state.view === "inbox") await refreshInbox();
         return;
       }
 
@@ -1062,14 +1321,44 @@
       if (action === "copy-email") copyText(button.dataset.email || "", "邮箱已复制");
       if (action === "toggle-alias") toggleAlias(button);
       if (action === "delete-alias") deleteAlias(button);
-      if (action === "close-message") $("#mail-detail").classList.remove("is-open");
+      if (action === "close-message") {
+        state.selectedMessageId = "";
+        renderMessages();
+        renderMailDetail(null);
+      }
+      if (action === "close-mailbox") {
+        state.selectedMailboxKey = "";
+        state.selectedMessageId = "";
+        state.messages = [];
+        state.messageDetails = {};
+        state.inboxPage = 1;
+        state.inboxTotal = 0;
+        state.inboxTotalPages = 1;
+        renderMailboxList();
+        renderMessages();
+      }
       if (action === "open-aliases") {
-        selectAccount(button.dataset.id);
-        $("#global-account-select").value = button.dataset.id;
         await setView("aliases");
+      }
+      if (action === "select-mailbox") {
+        selectMailbox(button.dataset.accountId, button.dataset.email);
+        await refreshInbox();
       }
       if (action === "select-message") {
         await loadMessageDetail(button.dataset.id);
+      }
+      if (action === "mail-page-prev" && state.inboxPage > 1) {
+        state.inboxPage--;
+        await refreshInbox();
+      }
+      if (action === "mail-page-next" && state.inboxPage < state.inboxTotalPages) {
+        state.inboxPage++;
+        await refreshInbox();
+      }
+      if (action === "set-mail-view") {
+        state.mailViewMode = button.dataset.mode;
+        const detail = state.messageDetails[`${state.selectedMailboxKey}:${state.selectedMessageId}`];
+        if (detail) renderMailDetail(detail);
       }
       if (action === "open-manual-login") {
         window.open(state.reloginConfig?.manual_login_url || "https://account.apple.com/account/manage/section/privacy", "icloud_hme_relogin", "popup,width=1120,height=820");
@@ -1077,8 +1366,8 @@
       if (action === "refresh-relogin-config") {
         setButtonLoading(button, true);
         try {
-          await refreshReloginConfig();
-          toast("重新登录配置已刷新");
+          await refreshSettings();
+          toast("服务配置已刷新");
         } catch (error) {
           toast(error.message, "error");
         } finally {
@@ -1103,33 +1392,25 @@
       }
     });
 
-    $("#global-account-select").addEventListener("change", async (event) => {
-      selectAccount(event.target.value);
-      if (state.view === "aliases") await refreshAliases({ force: true });
-      if (state.view === "inbox") {
-        renderMessages();
-        void refreshAliases({ force: true });
-        await refreshInbox();
-      }
-    });
-
     $("#alias-search").addEventListener("input", (event) => {
       state.aliasSearch = event.target.value;
       renderAliases();
     });
 
-    $("#refresh-view").addEventListener("click", refreshCurrentView);
-
-    $("#inbox-filter-form").addEventListener("submit", async (event) => {
-      event.preventDefault();
-      await refreshInbox();
+    $("#inbox-email-search").addEventListener("input", (event) => {
+      state.inboxEmailSearch = event.target.value;
+      renderMailboxList();
     });
 
+    $("#refresh-view").addEventListener("click", refreshCurrentView);
+
     document.addEventListener("submit", async (event) => {
-      if (event.target?.id !== "relogin-config-form") return;
+      const formId = event.target?.id;
+      if (formId !== "relogin-config-form" && formId !== "alias-pool-config-form") return;
       event.preventDefault();
       try {
-        await saveReloginConfig(event.target);
+        if (formId === "relogin-config-form") await saveReloginConfig(event.target);
+        if (formId === "alias-pool-config-form") await saveAliasPoolConfig(event.target);
       } catch (error) {
         toast(error.message, "error");
       }
@@ -1182,7 +1463,7 @@
     bindEvents();
     renderMessages();
     try {
-      await refreshReloginConfig();
+      await refreshSettings();
       await refreshAccounts();
       void refreshAliases({ force: true });
       window.setInterval(() => refreshAccounts({ silent: true }).catch(() => {}), 60_000);

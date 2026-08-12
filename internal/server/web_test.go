@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"icloud-hme/internal/account"
 	"icloud-hme/internal/hme"
+	"icloud-hme/internal/mail"
 )
 
 func TestInboxClientErrorExplainsAppPasswordFallback(t *testing.T) {
@@ -70,6 +72,69 @@ func TestReloginConfigEndpointDefaultsToManual(t *testing.T) {
 	body := res.Body.String()
 	if !strings.Contains(body, `"enabled":false`) || !strings.Contains(body, `"manual_login_url"`) {
 		t.Fatalf("unexpected config response: %s", body)
+	}
+}
+
+func TestAliasPoolConfigEndpointReadsEnvironment(t *testing.T) {
+	t.Setenv("ICLOUD_HME_AUTO_CREATE", "false")
+	t.Setenv("ICLOUD_HME_AUTO_CREATE_PER_HOUR", "12")
+	t.Setenv("ICLOUD_HME_AUTO_CREATE_INTERVAL", "5m")
+	t.Setenv("ICLOUD_HME_AUTO_CREATE_MAX_TOTAL", "250")
+	mgr, err := account.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(mgr, false)
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/alias-pool/config", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	for _, want := range []string{`"enabled":false`, `"per_hour":12`, `"interval_seconds":300`, `"max_total":250`} {
+		if !strings.Contains(res.Body.String(), want) {
+			t.Fatalf("response %s does not contain %s", res.Body.String(), want)
+		}
+	}
+}
+
+func TestUpdateAliasPoolConfigPersistsAndApplies(t *testing.T) {
+	envFile := filepath.Join(t.TempDir(), ".env")
+	t.Setenv("ICLOUD_HME_ENV_FILE", envFile)
+	t.Setenv("ICLOUD_HME_AUTO_CREATE", "true")
+	t.Setenv("ICLOUD_HME_AUTO_CREATE_PER_HOUR", "10")
+	t.Setenv("ICLOUD_HME_AUTO_CREATE_INTERVAL", "")
+	t.Setenv("ICLOUD_HME_AUTO_CREATE_MAX_TOTAL", "0")
+	mgr, err := account.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(mgr, false)
+	body := `{"enabled":false,"per_hour":15,"interval":"4m","max_total":300,"label":"pool","note":"managed"}`
+	req := httptest.NewRequest(http.MethodPut, "/api/alias-pool/config", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	for _, want := range []string{`"enabled":false`, `"per_hour":15`, `"interval_seconds":240`, `"max_total":300`} {
+		if !strings.Contains(res.Body.String(), want) {
+			t.Fatalf("response %s does not contain %s", res.Body.String(), want)
+		}
+	}
+	raw, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"ICLOUD_HME_AUTO_CREATE=false",
+		"ICLOUD_HME_AUTO_CREATE_PER_HOUR=15",
+		"ICLOUD_HME_AUTO_CREATE_INTERVAL=4m",
+		"ICLOUD_HME_AUTO_CREATE_MAX_TOTAL=300",
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf(".env %q does not contain %s", raw, want)
+		}
 	}
 }
 
@@ -198,6 +263,102 @@ func TestWebConsoleAndAPI(t *testing.T) {
 				t.Fatalf("body does not contain %q", tt.contains)
 			}
 		})
+	}
+}
+
+func TestWebConsoleUsesUnifiedThreeColumnInbox(t *testing.T) {
+	mgr, err := account.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(mgr, false)
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d", res.Code)
+	}
+	body := res.Body.String()
+	for _, want := range []string{`id="mailbox-list"`, `id="mail-list"`, `id="mail-detail"`, `id="mail-pagination"`, `id="inbox-email-search"`, `id="alias-pool-config-panel"`, `<th>所属账号</th>`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("web console does not contain %s", want)
+		}
+	}
+	if strings.Contains(body, `id="global-account-select"`) {
+		t.Fatal("web console still contains the global account selector")
+	}
+	if strings.Contains(body, `id="inbox-filter-form"`) || strings.Contains(body, `data-inbox-folder`) {
+		t.Fatal("web console still contains inbox filter controls")
+	}
+}
+
+func TestInboxPaginationHelpers(t *testing.T) {
+	messages := []mail.Message{{ID: "1"}, {ID: "2"}, {ID: "3"}}
+	page := pageMessages(messages, 2, 20)
+	if len(page) != 1 || page[0].ID != "3" {
+		t.Fatalf("unexpected page: %#v", page)
+	}
+	for _, test := range []struct{ total, perPage, want int }{
+		{0, 20, 1}, {1, 20, 1}, {20, 20, 1}, {21, 20, 2}, {41, 20, 3},
+	} {
+		if got := totalPages(test.total, test.perPage); got != test.want {
+			t.Fatalf("totalPages(%d, %d) = %d, want %d", test.total, test.perPage, got, test.want)
+		}
+	}
+}
+
+func TestInboxCacheCopiesAndClearsByAccount(t *testing.T) {
+	srv := &Server{inboxCache: inboxCacheStore{entries: make(map[string]inboxCacheEntry)}}
+	key := inboxCacheKey("acc_one", "Alias@icloud.com", mail.FolderAll, 20, 1, 0)
+	srv.setInboxCache(key, []mail.Message{{ID: "inbox:1"}}, 3)
+	messages, total, found := srv.getInboxCache(key)
+	if !found || total != 3 || len(messages) != 1 || messages[0].ID != "inbox:1" {
+		t.Fatalf("unexpected cache result found=%v total=%d messages=%#v", found, total, messages)
+	}
+	messages[0].ID = "changed"
+	cachedAgain, _, _ := srv.getInboxCache(key)
+	if cachedAgain[0].ID != "inbox:1" {
+		t.Fatal("cache returned its internal message slice")
+	}
+	srv.clearInboxCache("acc_one")
+	if _, _, found := srv.getInboxCache(key); found {
+		t.Fatal("account cache was not cleared")
+	}
+}
+
+func TestAliasPoolLogsUsePrimaryEmailAndNewestFirst(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dataDir, "accounts.json"), []byte(`{
+  "accounts": {
+    "acc_test": {
+      "id": "acc_test",
+      "icloud_email": "primary@icloud.com",
+      "real_email": "login@example.com"
+    }
+  }
+}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := account.NewManager(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(mgr, false)
+	srv.recordAliasPoolLog("error", "acc_test", "", "first")
+	srv.recordAliasPoolLog("success", "acc_test", "new@icloud.com", "second")
+
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/alias-pool/logs?limit=1", nil))
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", res.Code, res.Body.String())
+	}
+	body := res.Body.String()
+	for _, want := range []string{`"account_email":"primary@icloud.com"`, `"email":"new@icloud.com"`, `"message":"second"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("response %s does not contain %s", body, want)
+		}
+	}
+	if strings.Contains(body, `"message":"first"`) {
+		t.Fatalf("limit was not applied: %s", body)
 	}
 }
 

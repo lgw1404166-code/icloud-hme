@@ -29,10 +29,12 @@ services:
       ICLOUD_HME_RELOGIN_OTP_TTL: ${ICLOUD_HME_RELOGIN_OTP_TTL:-5m}
       ICLOUD_HME_RELOGIN_MANUAL_URL: ${ICLOUD_HME_RELOGIN_MANUAL_URL:-https://account.apple.com/account/manage/section/privacy}
       ICLOUD_HME_RELOGIN_PROTOCOL_TIMEOUT: ${ICLOUD_HME_RELOGIN_PROTOCOL_TIMEOUT:-3m}
+      ICLOUD_HME_ENV_FILE: /app/config/.env
     ports:
       - "127.0.0.1:18081:8081"
     volumes:
       - ./data:/app/data
+      - ./.env:/app/config/.env
     user: "1000:1000"
     read_only: true
     tmpfs:

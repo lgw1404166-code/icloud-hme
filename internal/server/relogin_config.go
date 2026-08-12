@@ -334,6 +334,12 @@ func dotenvLineKey(line string) (string, bool) {
 
 func sortedUpdateKeys(values map[string]string) []string {
 	preferred := []string{
+		"ICLOUD_HME_AUTO_CREATE",
+		"ICLOUD_HME_AUTO_CREATE_PER_HOUR",
+		"ICLOUD_HME_AUTO_CREATE_INTERVAL",
+		"ICLOUD_HME_AUTO_CREATE_MAX_TOTAL",
+		"ICLOUD_HME_AUTO_CREATE_LABEL",
+		"ICLOUD_HME_AUTO_CREATE_NOTE",
 		"ICLOUD_HME_RELOGIN_ENABLED",
 		"ICLOUD_HME_RELOGIN_MODE",
 		"ICLOUD_HME_RELOGIN_APPLE_ID",

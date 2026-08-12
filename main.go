@@ -60,7 +60,7 @@ func main() {
 	}
 	srv := server.New(mgr, *debug, apiKey)
 	startAccountSessionKeepAlive(mgr, accountSessionRefreshInterval())
-	srv.StartAliasPoolWorker(aliasPoolConfigFromEnv())
+	srv.StartAliasPoolWorker(server.AliasPoolConfigFromEnv())
 
 	log.Printf("HTTP 服务就绪 addr=%s", *addr)
 	if err := srv.Run(*addr); err != nil {
@@ -109,43 +109,6 @@ func decodeDotEnvValue(value string) string {
 		}
 	}
 	return strings.Trim(value, `"'`)
-}
-
-func aliasPoolConfigFromEnv() server.AliasPoolConfig {
-	enabledRaw := strings.TrimSpace(os.Getenv("ICLOUD_HME_AUTO_CREATE"))
-	enabled := true
-	if enabledRaw != "" {
-		enabled = !(enabledRaw == "0" || strings.EqualFold(enabledRaw, "off") || strings.EqualFold(enabledRaw, "false"))
-	}
-	cfg := server.AliasPoolConfig{
-		Enabled:  enabled,
-		PerHour:  envInt("ICLOUD_HME_AUTO_CREATE_PER_HOUR", 10),
-		MaxTotal: envInt("ICLOUD_HME_AUTO_CREATE_MAX_TOTAL", 0),
-		Label:    strings.TrimSpace(os.Getenv("ICLOUD_HME_AUTO_CREATE_LABEL")),
-		Note:     strings.TrimSpace(os.Getenv("ICLOUD_HME_AUTO_CREATE_NOTE")),
-		StartNow: true,
-	}
-	if raw := strings.TrimSpace(os.Getenv("ICLOUD_HME_AUTO_CREATE_INTERVAL")); raw != "" {
-		if interval, err := time.ParseDuration(raw); err == nil && interval > 0 {
-			cfg.Interval = interval
-		} else {
-			log.Printf("警告: ICLOUD_HME_AUTO_CREATE_INTERVAL=%q 无效，使用按小时速率计算的间隔", raw)
-		}
-	}
-	return cfg
-}
-
-func envInt(name string, fallback int) int {
-	raw := strings.TrimSpace(os.Getenv(name))
-	if raw == "" {
-		return fallback
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil {
-		log.Printf("警告: %s=%q 无效，使用默认值 %d", name, raw, fallback)
-		return fallback
-	}
-	return value
 }
 
 func accountSessionRefreshInterval() time.Duration {

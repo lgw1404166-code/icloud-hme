@@ -246,6 +246,7 @@ func (m *Manager) AddAccount(name, cookieInput, host, proxy string) (*Account, e
 			if info := client.AccountInfo(); info != nil {
 				acc.RealEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail)
 				acc.ICloudEmail = deriveICloudEmail(info)
+				acc.Name = firstNonEmpty(acc.ICloudEmail, acc.RealEmail, acc.Name)
 			}
 			if aliases, err := client.ListAliases(); err == nil {
 				acc.AliasTotal = len(aliases)

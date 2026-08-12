@@ -38,6 +38,32 @@ func TestMergeMessagesSortsAndLimitsAcrossFolders(t *testing.T) {
 	}
 }
 
+func TestPaginateMessages(t *testing.T) {
+	messages := []Message{{ID: "1"}, {ID: "2"}, {ID: "3"}, {ID: "4"}}
+	page := paginateMessages(messages, 2, 2)
+	if len(page) != 2 || page[0].ID != "3" || page[1].ID != "4" {
+		t.Fatalf("unexpected page: %#v", page)
+	}
+	if page := paginateMessages(messages, 8, 2); len(page) != 0 {
+		t.Fatalf("out-of-range page = %#v, want empty", page)
+	}
+}
+
+func TestMergeMessagePagesAcrossFolders(t *testing.T) {
+	inbox := []Message{
+		{ID: "inbox:3", Date: "2026-08-03T10:00:00Z"},
+		{ID: "inbox:1", Date: "2026-08-01T10:00:00Z"},
+	}
+	junk := []Message{
+		{ID: "junk:4", Date: "2026-08-04T10:00:00Z"},
+		{ID: "junk:2", Date: "2026-08-02T10:00:00Z"},
+	}
+	page := MergeMessagePages(1, 2, inbox, junk)
+	if len(page) != 2 || page[0].ID != "inbox:3" || page[1].ID != "junk:2" {
+		t.Fatalf("unexpected merged page: %#v", page)
+	}
+}
+
 func TestSetMessageFolderMakesUIDUnique(t *testing.T) {
 	message := Message{ID: "2"}
 	setMessageFolder(&message, FolderJunk)
@@ -72,5 +98,50 @@ func TestReadBodyPartsKeepsHTMLBody(t *testing.T) {
 	}
 	if got := stripHTML(htmlBody); !strings.Contains(got, "Hello World") {
 		t.Fatalf("stripped html = %q", got)
+	}
+}
+
+func TestReadBodyPartsRewritesInlineCIDImage(t *testing.T) {
+	raw := strings.Join([]string{
+		"Content-Type: multipart/related; boundary=mail-boundary",
+		"",
+		"--mail-boundary",
+		"Content-Type: text/html; charset=utf-8",
+		"",
+		`<html><body><img src="cid:hero@example"></body></html>`,
+		"--mail-boundary",
+		"Content-Type: image/png",
+		"Content-Transfer-Encoding: base64",
+		"Content-ID: <hero@example>",
+		"Content-Disposition: inline",
+		"",
+		"aGVsbG8=",
+		"--mail-boundary--",
+		"",
+	}, "\r\n")
+	msg, err := mail.ReadMessage(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, htmlBody, _, inlineImages, err := readBodyPartsWithInline(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewritten := rewriteCIDImages(htmlBody, inlineImages)
+	if !strings.Contains(rewritten, "data:image/png;base64,aGVsbG8=") || strings.Contains(rewritten, "cid:hero@example") {
+		t.Fatalf("inline image was not rewritten: %q", rewritten)
+	}
+}
+
+func TestStripHTMLIgnoresStylesAndScripts(t *testing.T) {
+	raw := `<html><head><style>.code { color: red; }</style><script>alert(1)</script></head><body><h1>Hello</h1><p>Your code is <strong>123456</strong>.</p></body></html>`
+	got := stripHTML(raw)
+	if !strings.Contains(got, "Hello") || !strings.Contains(got, "Your code is 123456.") {
+		t.Fatalf("stripHTML() = %q", got)
+	}
+	for _, unwanted := range []string{"color: red", "alert(1)"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("stripHTML() retained %q: %q", unwanted, got)
+		}
 	}
 }
