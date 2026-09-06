@@ -518,6 +518,22 @@ Content-Type: application/json
 }
 ```
 
+### 9.2 修复已使用别名的调用方标签
+
+当外部业务发现某个别名已经完成注册，但本地调用方标签尚未记录时，使用此幂等接口补写标签。该接口不会释放、停用或删除 Apple 侧别名。
+
+```http
+POST /api/aliases/:id/callers
+Content-Type: application/json
+
+{
+  "account_id": "acc_1",
+  "caller": "lovart"
+}
+```
+
+`id` 是别名的 `anonymousId`。成功后该 `caller` 会永久计入本地 `used_by`，直到显式调用释放接口。
+
 **参数说明:**
 - `account_id`（必填）— 别名所属账号 ID
 - `anonymous_id`（必填）— `POST /api/create` 返回的 `anonymousId`

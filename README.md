@@ -112,6 +112,8 @@ Apple 账户管理接口会在 `/account/manage/gs/ws/token` 响应中下发滚�
 
 外部调用方不再直接触发 Apple 创建请求。服务启动后会按后台节奏预创建别名并保存到本地池，`POST /api/create` 只负责按调用方身份领取一个“该调用方尚未使用过”的邮箱。领取成功会立刻永久保留该调用方标签；业务若在完成注册前明确失败，可调用 `POST /api/aliases/release` 释放自己的标签。
 
+若业务发现某个别名已经完成注册但调用方标签缺失，可调用 `POST /api/aliases/:id/callers` 幂等补写标签；该操作不会释放或删除别名。
+
 可用环境变量：
 
 - `ICLOUD_HME_AUTO_CREATE`：默认开启；设为 `0` / `off` / `false` 关闭后台创建。
