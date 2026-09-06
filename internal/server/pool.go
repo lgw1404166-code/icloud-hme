@@ -148,7 +148,7 @@ func (s *Server) recordAliasPoolLog(level, accountID, email, message string) {
 	accountEmail := ""
 	if accountID != "" {
 		if acc, exists := s.mgr.GetAccount(accountID); exists {
-			accountEmail = firstNonEmptyString(acc.ICloudEmail, acc.RealEmail, acc.ID)
+			accountEmail = firstNonEmptyString(acc.RealEmail, acc.ID)
 		} else {
 			accountEmail = accountID
 		}
@@ -265,10 +265,18 @@ func (s *Server) StartAliasPoolWorker(cfg AliasPoolConfig) {
 
 func (s *Server) runAliasPoolTick(cfg AliasPoolConfig) {
 	for _, acc := range s.mgr.ListAccounts() {
-		if acc == nil || acc.RequiresLogin {
+		if acc == nil || !acc.Enabled || acc.RequiresLogin {
+			if acc != nil && !acc.Enabled {
+				s.recordAliasPoolLog("info", acc.ID, "", "账号已停用，本轮已跳过")
+				continue
+			}
 			if acc != nil && acc.RequiresLogin {
 				s.recordAliasPoolLog("warning", acc.ID, "", "账号需要重新登录，本轮已跳过")
 			}
+			continue
+		}
+		if !acc.AutoCreateEnabled {
+			s.recordAliasPoolLog("info", acc.ID, "", "该账号已关闭自动创建，本轮已跳过")
 			continue
 		}
 		if cfg.MaxTotal > 0 && acc.AliasTotal >= cfg.MaxTotal {

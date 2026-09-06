@@ -2,17 +2,17 @@
 
 [English](#english) | 中文
 
-通过逆向 iCloud Web 接口和 IMAP 邮件协议，实现 Apple iCloud 隐藏邮箱别名的创建、列出和邮件收取功能。
+通过 Apple HME Web 接口和 MoeMail 公开 API，实现 iCloud 隐藏邮箱别名的创建、列出和邮件收取功能。
 
 ## 功能特性
 
 - ✅ **后台别名池** — 服务按固定速率预创建 iCloud 隐藏邮箱地址，调用方只领取本地池中的邮箱
 - ✅ **列出所有别名** — 查看账号下的所有 HME 别名
 - ✅ **调用方去重** — `chatgpt`、`ChatGPT` 等大小写视为同一身份，同一调用方不会重复拿到已领取过的别名
-- ✅ **收取邮件** — 通过 IMAP 或 Web API 读取发到 HME 别名的邮件，列表只读摘要，点击后按需加载正文/HTML
-- ✅ **双路径读信** — 邮件读取优先走 IMAP (App Password),无 App Password 时回退 Web API (Cookie)
+- ✅ **收取邮件** — 通过账号级 MoeMail 转发收件箱 API 精确读取发到 HME 别名的邮件和正文
+- ✅ **账号级收件配置** — 每个 Apple 账号可绑定独立的转发收件箱，不依赖 iCloud Mail 或 App Password
 - ✅ **多账号管理** — 支持多个 iCloud 账号并行管理
-- ✅ **双认证模式** — Cookie (创建别名 + 读邮件回退) 和 App Password (IMAP 优先)
+- ✅ **职责解耦** — Apple Cookie 只用于 HME 别名管理；邮件由转发服务 API 读取
 
 ## 快速开始
 
@@ -83,14 +83,18 @@ go build -o icloud-hme.exe .
         "X-APPLE-WEBAUTH-HSA-TRUST": "trust_value",
         "X-APPLE-DS-WEB-SESSION-TOKEN": "session_token"
       },
-      "app_password": "xxxx-xxxx-xxxx-xxxx",
+      "mail_receiver": {
+        "address": "relay@example.com",
+        "api_key": "your-moemail-api-key",
+        "base_url": "https://moemail.app"
+      },
       "proxy": "http://user:pass@host:port"
     }
   ]
 }
 ```
 
-> **提示:** 也可以通过管理页面或 API 动态添加账号。创建账号时必须提供浏览器导出的 Cookie；`app_password` 和 `proxy` 仍是可选的。
+> **提示:** 也可以通过管理页面或 API 动态添加账号。创建账号时必须提供浏览器导出的 Cookie；收件配置在账号行的“配置转发收件箱”操作中单独保存。
 
 ### 手动导入 Cookie
 
@@ -100,13 +104,13 @@ go build -o icloud-hme.exe .
 
 Cookie 是 iCloud 的临时会话凭据，不要发送给第三方；失效后可在账号列表使用“更新 Cookie”重新导入。
 
-Apple 账户管理接口会在 `/account/manage/gs/ws/token` 响应中下发滚动会话 Cookie（当前观察到 `caw-at`、`awat` 的 `Max-Age=900`）。服务会同步响应中的 `scnt` 与 CookieJar 新值，因此在持续调用期间会自动滚动；长时间空闲超过 Apple 的账户管理会话窗口后，仍需在账户页重新登录并更新 Cookie。该会话没有可由 App Password 替代的永久令牌。
+Apple 账户管理接口会在 `/account/manage/gs/ws/token` 响应中下发滚动会话 Cookie（当前观察到 `caw-at`、`awat` 的 `Max-Age=900`）。服务会同步响应中的 `scnt` 与 CookieJar 新值，因此在持续调用期间会自动滚动；长时间空闲超过 Apple 的账户管理会话窗口后，仍需在账户页重新登录并更新 Cookie。
 
 服务默认每 10 分钟主动刷新一次 Apple 账户管理会话，避免没有业务请求时短 Cookie 到期。通过 `ICLOUD_HME_ACCOUNT_REFRESH_INTERVAL` 调整间隔（例如 `8m`）；设为 `0` 或 `off` 可关闭。保活要求服务持续运行，已经过期或被 Apple 注销的根会话仍需重新登录。
 
 ### 后台别名池
 
-外部调用方不再直接触发 Apple 创建请求。服务启动后会按后台节奏预创建别名并保存到本地池，`POST /api/create` 只负责按调用方身份领取一个“该调用方尚未使用过”的邮箱。
+外部调用方不再直接触发 Apple 创建请求。服务启动后会按后台节奏预创建别名并保存到本地池，`POST /api/create` 只负责按调用方身份领取一个“该调用方尚未使用过”的邮箱。领取成功会立刻永久保留该调用方标签；业务若在完成注册前明确失败，可调用 `POST /api/aliases/release` 释放自己的标签。
 
 可用环境变量：
 
@@ -245,10 +249,10 @@ GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&folder=all&limit=20&days
 
 # 参数说明:
 #   account_id - 必填: 账号 ID
-#   alias      - 可选: 只读取发到该别名的邮件
-#   folder     - 可选: all/inbox/junk (默认 all)
+#   alias      - 必填: 要精确读取的 HME 别名
+#   folder     - 可选: all/inbox (默认 all；提供商 API 无垃圾邮件文件夹)
 #   limit      - 可选: 返回邮件数量 (默认 20)
-#   days       - 可选: 查找最近几天的邮件 (默认 7,仅 IMAP 模式)
+#   days       - 可选: 查找最近几天的邮件 (默认 0 表示不限)
 
 # 响应
 {
@@ -257,7 +261,7 @@ GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&folder=all&limit=20&days
     "account_id": "acc_1",
     "alias": "xyz123@icloud.com",
     "count": 2,
-    "method": "imap",
+    "method": "moemail_api",
     "messages": [
       {
         "id": "1042",
@@ -270,22 +274,21 @@ GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&folder=all&limit=20&days
   }
 }
 
-# 读取方式 (自动选择):
-#   method: "imap"    — 通过 App Password 认证 (优先)
-#   method: "web_api" — 通过 Cookie 认证,无需 App Password (回退)
+# 收件方式:
+#   method: "moemail_api"
 ```
 
 邮件列表默认只返回信封摘要以加快加载速度。需要正文时再调用：
 
 ```bash
-GET /api/inbox/message?account_id=acc_1&id=inbox:1042
+GET /api/inbox/message?account_id=acc_1&alias=xyz123@icloud.com&id=1042
 ```
 
 HTML 邮件会返回 `html` 字段，管理页面通过 sandbox iframe 直接展示网页邮件内容。
 
 ### 账号管理接口
 
-#### 列出所有账号
+#### 列出可用账号
 
 ```bash
 GET /api/accounts
@@ -299,6 +302,8 @@ GET /api/accounts
   ]
 }
 ```
+
+默认只返回已启用账号，停用账号不会作为可用 `account_id` 返回。管理场景可使用 `GET /api/accounts?include_disabled=true` 查看完整账号列表并重新启用账号。
 
 #### 添加账号
 
@@ -336,15 +341,16 @@ DELETE /api/accounts/:id
 }
 ```
 
-#### 设置 App Password
+#### 配置转发收件箱
 
 ```bash
-POST /api/accounts/:id/password
+PUT /api/accounts/:id/mail-receiver
 
 # 请求体
 {
-  "icloud_email": "your_email@icloud.com",
-  "app_password": "xxxx-xxxx-xxxx-xxxx"
+  "address": "relay@example.com",
+  "api_key": "your-moemail-api-key",
+  "base_url": "https://moemail.app"
 }
 
 # 响应
@@ -352,7 +358,9 @@ POST /api/accounts/:id/password
   "success": true,
   "data": {
     "id": "acc_1",
-    "icloud_email": "your_email@icloud.com"
+    "mail_receiver": {
+      "address": "relay@example.com"
+    }
   }
 }
 ```
@@ -448,11 +456,10 @@ DELETE /api/aliases/:id
 
 ### 方式一: Cookie 认证 (推荐,功能最完整)
 
-Cookie 认证用于后台创建别名、读取邮件回退和管理别名。
+Cookie 认证用于后台创建别名和管理别名。
 
 **适用范围:**
 - 后台创建/停用/激活/删除 HME 别名 ✅
-- 读取邮件 (通过 iCloud Web API,无需 App Password) ✅
 
 **获取 Cookie:**
 
@@ -472,24 +479,13 @@ Cookie 认证用于后台创建别名、读取邮件回退和管理别名。
 
 **注意:** 导出的 Cookie 值不要包含多余的引号或转义字符。
 
-### 方式二: App Password 认证 (IMAP,优先读邮件)
+### 转发收件箱：MoeMail
 
-App Password 用于 IMAP 读取邮件,是邮件读取的优先路径 (支持服务端按收件人搜索)。
+先在 Apple 隐私邮箱页面将“转发至”改为对应账号配置的固定 MoeMail 邮箱。随后在账号页面填写该固定邮箱地址、MoeMail 实例地址和 API Key。邮箱 ID 可选；未填时服务会用地址从 `/api/emails` 自动定位。
 
-**生成 App Password:**
+邮件接口只接受 `alias` 参数，并只返回能在 MoeMail 返回的 `to_address` 或原始收件头中精确匹配该 HME 别名的邮件。不能证明归属的邮件不会返回。
 
-1. 登录 [appleid.apple.com](https://appleid.apple.com)
-2. 进入 "登录和安全" → "App 专用密码"
-3. 生成新密码,用于此工具
-
-### 邮件读取双路径
-
-`GET /api/inbox` 默认同时查询 `INBOX` 和 `Junk`，可用 `folder=all|inbox|junk` 选择范围:
-
-1. **优先: IMAP (App Password)** — 设置了 App Password 时使用,支持服务端按收件人 (`TO`) 搜索
-2. **回退: Web API (Cookie)** — 仅 `folder=inbox` 支持;`all` 和 `junk` 必须使用 IMAP
-
-响应中包含 `"method": "web_api"` 或 `"method": "imap"` 字段,标识实际使用的读取方式。
+**必须保留原始收件人。** MoeMail 官方 Worker 当前只保存转发目标地址、发件人、主题与正文，不会持久化 Apple 转发前的 HME 别名或原始邮件头。直接使用该默认实现无法从一个固定转发邮箱准确区分多个 HME 别名。本服务检测到这一情况会报错而非误匹配。请使用保留原始 HME 收件人的 MoeMail 实例：在其收件 Worker 写入消息时，把原始 `To` / `X-Original-To` / `Delivered-To` 中的 HME 别名保存到 `message.toAddress`（并由 `/api/emails` 与详情接口返回）。
 
 ## 项目架构
 
@@ -503,10 +499,8 @@ icloud-hme/
     │   └── manager.go      # 多账号管理器 (持久化、客户端工厂)
     ├── hme/
     │   └── client.go       # iCloud HME Web 客户端 (Cookie 认证)
-    ├── mail/
-    │   ├── client.go       # IMAP 邮件客户端 (App Password 认证)
-    │   └── web_client.go   # Web 邮件客户端 (Cookie 认证,无需 App Password)
     └── server/
+        ├── receiver_api.go # MoeMail 收件 API 客户端
         └── server.go       # HTTP API (Gin 路由 + 请求处理)
 ```
 
@@ -514,15 +508,13 @@ icloud-hme/
 
 - **account.Manager**: 管理多个 iCloud 账号,负责配置持久化和客户端创建
 - **hme.Client**: 封装 iCloud HME Web API,支持 Cookie 认证
-- **mail.Client**: IMAP 邮件客户端 (App Password,优先读邮件)
-- **mail.WebClient**: 通过 iCloud Web API (mccgateway) 读取邮件,无需 App Password
+- **server receiver client**: 通过 MoeMail 公共 API 精确读取转发邮件和正文
 - **server.Server**: HTTP API 服务,提供 RESTful 接口
 
 ## 技术栈
 
 - **Go 1.26+**
 - **Gin** — HTTP 框架
-- **go-imap** — IMAP 协议实现
 - **tls-client** — TLS 指纹模拟 (绕过 iCloud 反爬)
 
 ## 常见问题
@@ -533,15 +525,15 @@ icloud-hme/
 
 ### Q: 调用方怎么避免拿到重复邮箱?
 
-**A:** 调用 `POST /api/create` 时传入 `caller`，例如 `chatgpt`。本项目会记录该调用方已领取过哪些别名；下次同一调用方再领取时会跳过这些邮箱。
+**A:** 调用 `POST /api/create` 时传入 `caller`，例如 `chatgpt`。本项目会立刻记录该调用方已领取过哪些别名；下次同一调用方再领取时会跳过这些邮箱。若业务在完成注册前明确失败，可调用 `POST /api/aliases/release` 并传入 `account_id`、`anonymous_id`、`caller` 来释放自己的标签。
 
 ### Q: 读取邮件返回超时?
 
-**A:** 检查网络连接，确保可以访问 `imap.mail.me.com:993`。
+**A:** 检查账号页面中配置的 MoeMail API 地址、API Key、转发邮箱地址是否一致，并确认 Apple 隐私邮箱页已转发到该地址。
 
 ### Q: 如何查看某个别名收到了哪些邮件?
 
-**A:** 调用 `GET /api/inbox?account_id=acc_1&alias=your_alias@icloud.com&folder=all`，默认同时搜索收件箱和垃圾邮件。
+**A:** 调用 `GET /api/inbox?account_id=acc_1&alias=your_alias@icloud.com&folder=all`。该账号必须已在账号页面配置 MoeMail 转发收件箱。
 
 ### Q: 支持同时管理多个 iCloud 账号吗?
 
@@ -593,15 +585,15 @@ MIT License
 
 ## English
 
-A local management tool for Apple iCloud Hide My Email (HME) aliases, supporting creation, listing, and email reading through reverse-engineered iCloud Web API and IMAP protocol.
+A local management tool for Apple iCloud Hide My Email (HME) aliases. Apple Cookies manage aliases; the MoeMail API reads forwarded messages.
 
 ### Features
 
 - Create HME aliases automatically
 - List all aliases for an account
-- Read emails sent to HME aliases via IMAP
+- Read forwarded HME messages and bodies through the MoeMail API
 - Manage multiple iCloud accounts
-- Dual authentication: Cookie and App Password
+- Per-account Cookie and forwarding mailbox provider configuration
 
 ### Quick Start
 

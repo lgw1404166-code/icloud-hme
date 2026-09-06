@@ -16,42 +16,73 @@ import (
 
 	"github.com/google/uuid"
 	"icloud-hme/internal/hme"
-	"icloud-hme/internal/mail"
 )
 
 // Account 描述一个 iCloud 账号。
 type Account struct {
-	ID            string                 `json:"id"`
-	Name          string                 `json:"name"`
-	RealEmail     string                 `json:"real_email"`
-	ICloudEmail   string                 `json:"icloud_email"`
-	Cookies       map[string]string      `json:"cookies"`
-	Host          string                 `json:"host"`
-	Proxy         string                 `json:"proxy,omitempty"` // HTTP/SOCKS5 代理
-	AppPassword   string                 `json:"app_password,omitempty"`
-	HMEClientID   string                 `json:"hme_client_id,omitempty"`
-	Status        string                 `json:"status"` // active / error
-	AliasTotal    int                    `json:"alias_total"`
-	AliasActive   int                    `json:"alias_active"`
-	AliasUsages   map[string]*AliasUsage `json:"alias_usages,omitempty"`
-	RequiresLogin bool                   `json:"requires_login,omitempty"`
-	LastValidated string                 `json:"last_validated"`
-	LastError     string                 `json:"last_error,omitempty"`
-	CreatedAt     string                 `json:"created_at"`
+	ID                string                 `json:"id"`
+	Name              string                 `json:"name"`
+	RealEmail         string                 `json:"real_email"`
+	Cookies           map[string]string      `json:"cookies"`
+	Host              string                 `json:"host"`
+	Proxy             string                 `json:"proxy,omitempty"` // HTTP/SOCKS5 代理
+	MailReceiver      *MailReceiverConfig    `json:"mail_receiver,omitempty"`
+	HMEClientID       string                 `json:"hme_client_id,omitempty"`
+	Status            string                 `json:"status"` // active / error
+	Enabled           bool                   `json:"enabled"`
+	AutoCreateEnabled bool                   `json:"auto_create_enabled"`
+	AliasTotal        int                    `json:"alias_total"`
+	AliasActive       int                    `json:"alias_active"`
+	AliasUsages       map[string]*AliasUsage `json:"alias_usages,omitempty"`
+	RequiresLogin     bool                   `json:"requires_login,omitempty"`
+	LastValidated     string                 `json:"last_validated"`
+	LastError         string                 `json:"last_error,omitempty"`
+	CreatedAt         string                 `json:"created_at"`
+}
+
+// MailReceiverConfig stores one account's fixed MoeMail forwarding mailbox.
+// APIKey is persisted because the server needs it to read mail, but is
+// stripped from every public account response.
+type MailReceiverConfig struct {
+	BaseURL                 string `json:"base_url,omitempty"`
+	Address                 string `json:"address,omitempty"`
+	MailboxID               string `json:"mailbox_id,omitempty"`
+	APIKey                  string `json:"api_key,omitempty"`
+	CleanupEnabled          bool   `json:"cleanup_enabled,omitempty"`
+	CleanupRetentionSeconds int    `json:"cleanup_retention_seconds,omitempty"`
 }
 
 // AliasUsage 是本项目对某个 HME 别名的本地使用记录。
 //
 // Apple 只维护别名本身；调用方身份与“是否领取过”的关系由本项目保存。
 type AliasUsage struct {
-	Email       string            `json:"email"`
-	AnonymousID string            `json:"anonymous_id,omitempty"`
-	Label       string            `json:"label,omitempty"`
-	Active      bool              `json:"active"`
-	CreatedAt   string            `json:"created_at,omitempty"`
-	CreatedBy   string            `json:"created_by,omitempty"`
-	LastSeenAt  string            `json:"last_seen_at,omitempty"`
-	UsedBy      map[string]string `json:"used_by,omitempty"`
+	Email          string                              `json:"email"`
+	AnonymousID    string                              `json:"anonymous_id,omitempty"`
+	Label          string                              `json:"label,omitempty"`
+	Active         bool                                `json:"active"`
+	CreatedAt      string                              `json:"created_at,omitempty"`
+	CreatedBy      string                              `json:"created_by,omitempty"`
+	LastSeenAt     string                              `json:"last_seen_at,omitempty"`
+	UsedBy         map[string]string                   `json:"used_by,omitempty"`
+	PendingCallers map[string]*PendingCallerAllocation `json:"pending_callers,omitempty"`
+}
+
+// PendingCallerAllocation is retained only to read data written by older
+// versions. New allocations are permanent immediately and do not create a
+// pending caller entry.
+type PendingCallerAllocation struct {
+	AllocatedAt string `json:"allocated_at"`
+	ExpiresAt   string `json:"expires_at"`
+	LastReadAt  string `json:"last_read_at,omitempty"`
+}
+
+const callerTagConfirmationWindow = 5 * time.Minute
+
+// CallerReadObservation describes the effect of a caller's inbox read on a
+// just-allocated alias tag.
+type CallerReadObservation struct {
+	Confirmed bool
+	Cleared   bool
 }
 
 // Manager 管理多个 iCloud 账号,线程安全。
@@ -109,9 +140,45 @@ func (m *Manager) load() error {
 	if m.accounts == nil {
 		m.accounts = make(map[string]*Account)
 	}
+	var rawWrapper struct {
+		Accounts map[string]json.RawMessage `json:"accounts"`
+	}
+	if err := json.Unmarshal(raw, &rawWrapper); err != nil {
+		return err
+	}
 	migrated := false
-	for _, acc := range m.accounts {
+	for id, acc := range m.accounts {
 		if ensureHMEClientID(acc) {
+			migrated = true
+		}
+		var rawAccount struct {
+			Enabled           *bool   `json:"enabled"`
+			AutoCreateEnabled *bool   `json:"auto_create_enabled"`
+			ICloudEmail       *string `json:"icloud_email"`
+			AppPassword       *string `json:"app_password"`
+			MailReceiver      *struct {
+				Provider json.RawMessage `json:"provider"`
+				Token    json.RawMessage `json:"token"`
+			} `json:"mail_receiver"`
+		}
+		if err := json.Unmarshal(rawWrapper.Accounts[id], &rawAccount); err != nil {
+			return err
+		}
+		if rawAccount.AutoCreateEnabled == nil {
+			acc.AutoCreateEnabled = true
+			migrated = true
+		}
+		if rawAccount.Enabled == nil {
+			acc.Enabled = true
+			migrated = true
+		}
+		if rawAccount.ICloudEmail != nil || rawAccount.AppPassword != nil {
+			migrated = true
+		}
+		if rawAccount.MailReceiver != nil && (len(rawAccount.MailReceiver.Provider) > 0 || len(rawAccount.MailReceiver.Token) > 0) {
+			// Provider-style receiver configurations belonged to the removed
+			// multi-provider implementation and must not remain active.
+			acc.MailReceiver = nil
 			migrated = true
 		}
 	}
@@ -220,14 +287,16 @@ func (m *Manager) AddAccount(name, cookieInput, host, proxy string) (*Account, e
 	}
 
 	acc := &Account{
-		ID:          "acc_" + uuid.New().String()[:8],
-		Name:        name,
-		Cookies:     cookies,
-		Host:        host,
-		Proxy:       proxy,
-		HMEClientID: uuid.New().String(),
-		Status:      "pending",
-		CreatedAt:   time.Now().Format(time.RFC3339),
+		ID:                "acc_" + uuid.New().String()[:8],
+		Name:              name,
+		Cookies:           cookies,
+		Host:              host,
+		Proxy:             proxy,
+		HMEClientID:       uuid.New().String(),
+		Status:            "pending",
+		Enabled:           true,
+		AutoCreateEnabled: true,
+		CreatedAt:         time.Now().Format(time.RFC3339),
 	}
 
 	// 有 Cookie 才校验会话
@@ -245,12 +314,13 @@ func (m *Manager) AddAccount(name, cookieInput, host, proxy string) (*Account, e
 			acc.RequiresLogin = false
 			if info := client.AccountInfo(); info != nil {
 				acc.RealEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail)
-				acc.ICloudEmail = deriveICloudEmail(info)
-				acc.Name = firstNonEmpty(acc.ICloudEmail, acc.RealEmail, acc.Name)
+				acc.Name = firstNonEmpty(acc.RealEmail, acc.Name)
 			}
 			if aliases, err := client.ListAliases(); err == nil {
+				acc.AliasUsages = make(map[string]*AliasUsage, len(aliases))
 				acc.AliasTotal = len(aliases)
 				for _, a := range aliases {
+					ensureAliasUsageLocked(acc, a, "icloud_sync")
 					if a.Active {
 						acc.AliasActive++
 					}
@@ -293,6 +363,7 @@ func (m *Manager) GetAccount(id string) (*Account, bool) {
 	cp := *acc
 	cp.Cookies = cloneStringMap(acc.Cookies)
 	cp.AliasUsages = cloneAliasUsageMap(acc.AliasUsages)
+	cp.MailReceiver = cloneMailReceiverConfig(acc.MailReceiver)
 	return &cp, true
 }
 
@@ -304,7 +375,7 @@ func (m *Manager) ListAccounts() []*Account {
 	for _, acc := range m.accounts {
 		cp := *acc
 		cp.Cookies = nil
-		cp.AppPassword = ""
+		cp.MailReceiver = publicMailReceiverConfig(acc.MailReceiver)
 		cp.HMEClientID = ""
 		cp.AliasUsages = nil
 		out = append(out, &cp)
@@ -329,105 +400,40 @@ func (m *Manager) HMEClient(id string, verbose bool) (*hme.Client, error) {
 	if !ok {
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
+	if !acc.Enabled {
+		return nil, fmt.Errorf("账号已停用，当前功能不可用: %s", id)
+	}
 	if len(cookies) == 0 {
 		return nil, fmt.Errorf("账号未配置 Cookie，无法使用 HME 功能")
 	}
 	return hme.NewClientWithID(cookies, host, proxy, clientID, verbose)
 }
 
-// MailClient 为指定账号创建 IMAP 邮件客户端。
-// 需要事先设置 iCloud 邮箱和 App 专用密码。
-func (m *Manager) MailClient(id string) (*mail.Client, error) {
+// SetMailReceiver replaces the account's forwarding mailbox configuration.
+// Passing nil removes it. Credentials are never exposed through ListAccounts.
+func (m *Manager) SetMailReceiver(id string, receiver *MailReceiverConfig) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	acc, ok := m.accounts[id]
-	var imapEmail, realEmail, appPassword string
-	if ok {
-		imapEmail = acc.ICloudEmail
-		realEmail = acc.RealEmail
-		appPassword = acc.AppPassword
-	}
-	m.mu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("账号不存在: %s", id)
-	}
-	if imapEmail == "" {
-		imapEmail = realEmail
-	}
-	if !isICloudDomain(imapEmail) {
-		return nil, fmt.Errorf("账号未设置 iCloud 邮箱 (当前: %s)", imapEmail)
-	}
-	if appPassword == "" {
-		return nil, fmt.Errorf("账号未设置 App 专用密码")
-	}
-	return mail.NewClient(imapEmail, appPassword), nil
-}
-
-// WebMailClient 为指定账号创建 Web 邮件客户端。
-// 使用 Cookie 认证，无需 App Password。
-func (m *Manager) WebMailClient(id string) (*mail.WebClient, error) {
-	m.mu.Lock()
-	acc, ok := m.accounts[id]
-	var cookies map[string]string
-	var host string
-	if ok {
-		cookies = cloneStringMap(acc.Cookies)
-		host = acc.Host
-	}
-	m.mu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("账号不存在: %s", id)
-	}
-	if len(cookies) == 0 {
-		return nil, fmt.Errorf("账号未配置 Cookie，无法读取邮件")
-	}
-	// 从 cookies 中获取 dsid
-	dsid := ""
-	if v, ok := cookies["X-APPLE-WEBAUTH-USER"]; ok {
-		// 解析 "v=1:s=1:d=22789132008" 格式
-		parts := strings.Split(v, ":d=")
-		if len(parts) == 2 {
-			dsid = parts[1]
-		}
-	}
-	return mail.NewWebClient(cookies, dsid, host), nil
-}
-
-// SetAppPassword 设置 iCloud 邮箱和 App 专用密码,并测试 IMAP 连接。
-func (m *Manager) SetAppPassword(id, icloudEmail, appPassword string) error {
-	m.mu.Lock()
-	acc, ok := m.accounts[id]
-	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
-	if icloudEmail == "" {
-		return fmt.Errorf("iCloud 邮箱不能为空")
-	}
-	if appPassword == "" {
-		return fmt.Errorf("App 专用密码不能为空")
-	}
+	acc.MailReceiver = cloneMailReceiverConfig(receiver)
+	return m.save()
+}
 
-	// 测试连接
-	mc := mail.NewClient(icloudEmail, appPassword)
-	if err := mc.Connect(); err != nil {
-		return err
-	}
-	count, err := mc.InboxCount()
-	mc.Disconnect()
-	if err != nil {
-		return err
-	}
-
+// MailReceiver returns a private copy for the server-side provider client.
+func (m *Manager) MailReceiver(id string) (*MailReceiverConfig, error) {
 	m.mu.Lock()
-	acc.ICloudEmail = icloudEmail
-	acc.AppPassword = appPassword
-	err = m.save()
-	m.mu.Unlock()
-	if err != nil {
-		return err
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
-	_ = count
-	return nil
+	if acc.MailReceiver == nil {
+		return nil, fmt.Errorf("账号未配置转发收件箱提供商")
+	}
+	return cloneMailReceiverConfig(acc.MailReceiver), nil
 }
 
 // SaveCookies 保存指定账号的最新 Cookie（HMEClient 操作后刷新的 token）。
@@ -441,6 +447,45 @@ func (m *Manager) SaveCookies(id string, cookies map[string]string) error {
 	}
 	acc.Cookies = cloneStringMap(cookies)
 	return m.save()
+}
+
+// SetAutoCreateEnabled controls whether the background alias pool may create aliases for an account.
+func (m *Manager) SetAutoCreateEnabled(id string, enabled bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	acc.AutoCreateEnabled = enabled
+	return m.save()
+}
+
+// SetEnabled controls whether an account participates in any iCloud-HME operation.
+// Cookie and forwarding mailbox configuration remain available while disabled.
+func (m *Manager) SetEnabled(id string, enabled bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	acc.Enabled = enabled
+	return m.save()
+}
+
+// EnsureEnabled verifies that an account exists and is available for business operations.
+func (m *Manager) EnsureEnabled(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	if !acc.Enabled {
+		return fmt.Errorf("账号已停用，当前功能不可用: %s", id)
+	}
+	return nil
 }
 
 // MarkLoginRequired 标记账号需要重新登录。前端会据此弹窗并打开 Apple 登录页。
@@ -479,16 +524,81 @@ func (m *Manager) RegisterCreatedAlias(id string, created *hme.CreateResult, coo
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
+	if !acc.Enabled {
+		return fmt.Errorf("账号已停用，当前功能不可用: %s", id)
+	}
 	if cookies != nil {
 		acc.Cookies = cloneStringMap(cookies)
 	}
+	key := aliasKey(alias.Email)
+	existing := acc.AliasUsages[key]
+	wasActive := existing != nil && existing.Active
 	ensureAliasUsageLocked(acc, alias, "auto_pool")
-	acc.AliasTotal = countAliasUsages(acc, false)
-	acc.AliasActive = countAliasUsages(acc, true)
+	// AliasUsages intentionally retains historical records for aliases that
+	// were deleted upstream. Recounting the map here would therefore turn
+	// deleted aliases into phantom aliases and trip the pool max_total gate.
+	// Keep the Apple-sourced counters and account only for this new alias.
+	if existing == nil {
+		acc.AliasTotal++
+	}
+	if !wasActive && alias.Active {
+		acc.AliasActive++
+	}
 	acc.Status = "active"
 	acc.RequiresLogin = false
 	acc.LastError = ""
 	return m.save()
+}
+
+// SetAliasActive updates the local counters after a successful upstream
+// activate/deactivate operation. AliasTotal includes inactive aliases that
+// still exist upstream; AliasActive tracks only currently active aliases.
+func (m *Manager) SetAliasActive(id, anonymousID string, active bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	for _, usage := range acc.AliasUsages {
+		if usage == nil || usage.AnonymousID != anonymousID || usage.Active == active {
+			continue
+		}
+		usage.Active = active
+		if active {
+			acc.AliasActive++
+		} else if acc.AliasActive > 0 {
+			acc.AliasActive--
+		}
+		return m.save()
+	}
+	return nil
+}
+
+// MarkAliasDeleted removes a successfully deleted alias from the local pool
+// and counters. Caller usage history for a permanently deleted alias is no
+// longer allocatable and is intentionally discarded.
+func (m *Manager) MarkAliasDeleted(id, anonymousID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return fmt.Errorf("账号不存在: %s", id)
+	}
+	for key, usage := range acc.AliasUsages {
+		if usage == nil || usage.AnonymousID != anonymousID {
+			continue
+		}
+		delete(acc.AliasUsages, key)
+		if usage.Active && acc.AliasActive > 0 {
+			acc.AliasActive--
+		}
+		if acc.AliasTotal > 0 {
+			acc.AliasTotal--
+		}
+		return m.save()
+	}
+	return nil
 }
 
 // RefreshAccountSessions 刷新所有使用 Apple 账户管理协议的会话。
@@ -505,6 +615,9 @@ func (m *Manager) RefreshAccountSessions() []SessionRefreshResult {
 	m.mu.Lock()
 	candidates := make([]candidate, 0, len(m.accounts))
 	for id, acc := range m.accounts {
+		if !acc.Enabled {
+			continue
+		}
 		if len(acc.Cookies) == 0 {
 			continue
 		}
@@ -571,6 +684,9 @@ func (m *Manager) SaveAliasStats(id string, aliases []hme.Alias, cookies map[str
 	if !ok {
 		return fmt.Errorf("账号不存在: %s", id)
 	}
+	if !acc.Enabled {
+		return fmt.Errorf("账号已停用，当前功能不可用: %s", id)
+	}
 	if cookies != nil {
 		acc.Cookies = cloneStringMap(cookies)
 	}
@@ -612,11 +728,13 @@ func (m *Manager) DecorateAliases(id string, aliases []hme.Alias) []hme.Alias {
 		out[i].UsedBy = sortedUsageCallers(usage.UsedBy)
 		out[i].UsedByCount = len(out[i].UsedBy)
 		out[i].LastUsedAt = latestUsageAt(usage.UsedBy)
+		out[i].PendingCallers = sortedPendingCallers(usage.PendingCallers)
 	}
 	return out
 }
 
 // AcquireAlias 为某个调用方从本地别名池领取一个尚未被该调用方领取过的别名。
+// A successful claim is permanent until that caller explicitly releases it.
 func (m *Manager) AcquireAlias(id, caller string) (*hme.Alias, error) {
 	caller = NormalizeCaller(caller)
 	if caller == "" {
@@ -629,11 +747,15 @@ func (m *Manager) AcquireAlias(id, caller string) (*hme.Alias, error) {
 	if !ok {
 		return nil, fmt.Errorf("账号不存在: %s", id)
 	}
+	if !acc.Enabled {
+		return nil, fmt.Errorf("账号已停用，当前功能不可用: %s", id)
+	}
 	if len(acc.AliasUsages) == 0 {
 		return nil, fmt.Errorf("当前账号本地别名池为空，请等待后台定时创建或先刷新别名列表")
 	}
 
-	now := time.Now().Format(time.RFC3339)
+	now := time.Now()
+	changed := expirePendingAliasCallersLocked(acc, now)
 	var selected *AliasUsage
 	for _, usage := range acc.AliasUsages {
 		if usage == nil || !usage.Active || usage.Email == "" {
@@ -647,26 +769,210 @@ func (m *Manager) AcquireAlias(id, caller string) (*hme.Alias, error) {
 		}
 	}
 	if selected == nil {
+		if changed {
+			if err := m.save(); err != nil {
+				return nil, err
+			}
+		}
 		return nil, fmt.Errorf("该调用方暂无可领取的新别名，请等待后台定时创建")
 	}
-	if selected.UsedBy == nil {
-		selected.UsedBy = make(map[string]string)
-	}
-	selected.UsedBy[caller] = now
+	markCallerAllocationLocked(selected, caller, now)
 	if err := m.save(); err != nil {
 		return nil, err
 	}
 	alias := hme.Alias{
-		Email:       selected.Email,
-		AnonymousID: selected.AnonymousID,
-		Label:       selected.Label,
-		Active:      selected.Active,
-		CreatedAt:   selected.CreatedAt,
-		UsedBy:      sortedUsageCallers(selected.UsedBy),
-		UsedByCount: len(selected.UsedBy),
-		LastUsedAt:  latestUsageAt(selected.UsedBy),
+		Email:          selected.Email,
+		AnonymousID:    selected.AnonymousID,
+		Label:          selected.Label,
+		Active:         selected.Active,
+		CreatedAt:      selected.CreatedAt,
+		UsedBy:         sortedUsageCallers(selected.UsedBy),
+		UsedByCount:    len(selected.UsedBy),
+		LastUsedAt:     latestUsageAt(selected.UsedBy),
+		PendingCallers: sortedPendingCallers(selected.PendingCallers),
 	}
 	return &alias, nil
+}
+
+// AcquireAliasAny atomically allocates an active alias from any enabled
+// account which has not already allocated that alias to caller. It is used by
+// callers that do not care which Apple account owns the alias, but need a
+// usable address without retrying exhausted accounts themselves.
+func (m *Manager) AcquireAliasAny(caller string) (string, *hme.Alias, error) {
+	caller = NormalizeCaller(caller)
+	if caller == "" {
+		return "", nil, fmt.Errorf("调用方身份 caller 必填")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	changed := false
+	var selected *AliasUsage
+	selectedAccountID := ""
+	for accountID, acc := range m.accounts {
+		if acc == nil || !acc.Enabled {
+			continue
+		}
+		if expirePendingAliasCallersLocked(acc, time.Now()) {
+			changed = true
+		}
+		for _, usage := range acc.AliasUsages {
+			if usage == nil || !usage.Active || usage.Email == "" {
+				continue
+			}
+			if _, used := usage.UsedBy[caller]; used {
+				continue
+			}
+			if selected == nil || betterAliasCandidate(usage, selected) ||
+				(!betterAliasCandidate(selected, usage) && accountID < selectedAccountID) {
+				selected = usage
+				selectedAccountID = accountID
+			}
+		}
+	}
+	if selected == nil {
+		if changed {
+			if saveErr := m.save(); saveErr != nil {
+				return "", nil, saveErr
+			}
+		}
+		return "", nil, fmt.Errorf("所有启用账号中，该调用方暂无可领取的新别名，请等待后台定时创建")
+	}
+	markCallerAllocationLocked(selected, caller, time.Now())
+	if err := m.save(); err != nil {
+		return "", nil, err
+	}
+	return selectedAccountID, &hme.Alias{
+		Email:          selected.Email,
+		AnonymousID:    selected.AnonymousID,
+		Label:          selected.Label,
+		Active:         selected.Active,
+		CreatedAt:      selected.CreatedAt,
+		UsedBy:         sortedUsageCallers(selected.UsedBy),
+		UsedByCount:    len(selected.UsedBy),
+		LastUsedAt:     latestUsageAt(selected.UsedBy),
+		PendingCallers: sortedPendingCallers(selected.PendingCallers),
+	}, nil
+}
+
+// MarkAliasCaller records that a caller already owns/uses an alias without
+// allocating a different alias. This is used when an external consumer finds
+// an alias that was registered before caller-tag tracking was enabled.
+// The operation is idempotent for the same caller and alias.
+func (m *Manager) MarkAliasCaller(id, anonymousID, caller string) (*hme.Alias, error) {
+	anonymousID = strings.TrimSpace(anonymousID)
+	caller = NormalizeCaller(caller)
+	if anonymousID == "" {
+		return nil, fmt.Errorf("别名 anonymousId 必填")
+	}
+	if caller == "" {
+		return nil, fmt.Errorf("调用方身份 caller 必填")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[strings.TrimSpace(id)]
+	if !ok {
+		return nil, fmt.Errorf("账号不存在: %s", id)
+	}
+	var selected *AliasUsage
+	for _, usage := range acc.AliasUsages {
+		if usage != nil && usage.AnonymousID == anonymousID {
+			selected = usage
+			break
+		}
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("别名不存在: %s", anonymousID)
+	}
+	markCallerAllocationLocked(selected, caller, time.Now())
+	if err := m.save(); err != nil {
+		return nil, err
+	}
+	return &hme.Alias{
+		Email:          selected.Email,
+		AnonymousID:    selected.AnonymousID,
+		Label:          selected.Label,
+		Active:         selected.Active,
+		CreatedAt:      selected.CreatedAt,
+		UsedBy:         sortedUsageCallers(selected.UsedBy),
+		UsedByCount:    len(selected.UsedBy),
+		LastUsedAt:     latestUsageAt(selected.UsedBy),
+		PendingCallers: sortedPendingCallers(selected.PendingCallers),
+	}, nil
+}
+
+// RemoveAliasCaller deletes one local caller allocation without changing the Apple alias.
+func (m *Manager) RemoveAliasCaller(id, anonymousID, caller string) (*hme.Alias, error) {
+	anonymousID = strings.TrimSpace(anonymousID)
+	caller = NormalizeCaller(caller)
+	if anonymousID == "" {
+		return nil, fmt.Errorf("别名 anonymousId 必填")
+	}
+	if caller == "" {
+		return nil, fmt.Errorf("调用方身份 caller 必填")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	acc, ok := m.accounts[id]
+	if !ok {
+		return nil, fmt.Errorf("账号不存在: %s", id)
+	}
+	var selected *AliasUsage
+	for _, usage := range acc.AliasUsages {
+		if usage != nil && usage.AnonymousID == anonymousID {
+			selected = usage
+			break
+		}
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("别名不存在: %s", anonymousID)
+	}
+	removed := false
+	for storedCaller := range selected.UsedBy {
+		if NormalizeCaller(storedCaller) == caller {
+			delete(selected.UsedBy, storedCaller)
+			removed = true
+		}
+	}
+	for storedCaller := range selected.PendingCallers {
+		if NormalizeCaller(storedCaller) == caller {
+			delete(selected.PendingCallers, storedCaller)
+			removed = true
+		}
+	}
+	if !removed {
+		return nil, fmt.Errorf("该别名没有调用方记录: %s", caller)
+	}
+	if err := m.save(); err != nil {
+		return nil, err
+	}
+	return &hme.Alias{
+		Email:          selected.Email,
+		AnonymousID:    selected.AnonymousID,
+		Label:          selected.Label,
+		Active:         selected.Active,
+		CreatedAt:      selected.CreatedAt,
+		UsedBy:         sortedUsageCallers(selected.UsedBy),
+		UsedByCount:    len(selected.UsedBy),
+		LastUsedAt:     latestUsageAt(selected.UsedBy),
+		PendingCallers: sortedPendingCallers(selected.PendingCallers),
+	}, nil
+}
+
+// ObserveCallerInboxRead is kept for compatibility with existing inbox
+// callers. Claims are permanent at allocation time, so reading mail no longer
+// changes a caller label.
+func (m *Manager) ObserveCallerInboxRead(id, email, caller string, hasMail bool) (CallerReadObservation, error) {
+	return CallerReadObservation{}, nil
+}
+
+// ExpirePendingCallerAllocations is retained as a no-op for backwards
+// compatibility. Caller labels are no longer released by time-based expiry.
+func (m *Manager) ExpirePendingCallerAllocations() (int, error) {
+	return 0, nil
 }
 
 // UpdateCookies 更新指定账号的 Cookie,并自动校验会话有效性。
@@ -712,7 +1018,7 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 	status := "active"
 	lastError := ""
 	lastValidated := time.Now().Format(time.RFC3339)
-	var realEmail, icloudEmail string
+	var realEmail string
 	var aliases []hme.Alias
 	aliasesLoaded := false
 	if err := validateHMESession(client); err != nil {
@@ -721,7 +1027,6 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 	} else {
 		if info := client.AccountInfo(); info != nil {
 			realEmail = firstNonEmpty(info.AppleID, info.PrimaryEmail)
-			icloudEmail = deriveICloudEmail(info)
 		}
 		if listed, listErr := client.ListAliases(); listErr == nil {
 			aliases = listed
@@ -744,9 +1049,6 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 		if realEmail != "" {
 			acc.RealEmail = realEmail
 		}
-		if acc.ICloudEmail == "" && icloudEmail != "" {
-			acc.ICloudEmail = icloudEmail
-		}
 	}
 	if status == "error" {
 		acc.RequiresLogin = true
@@ -756,6 +1058,9 @@ func (m *Manager) UpdateCookies(id string, cookies map[string]string) error {
 			if usage != nil {
 				usage.Active = false
 			}
+		}
+		if acc.AliasUsages == nil {
+			acc.AliasUsages = make(map[string]*AliasUsage, len(aliases))
 		}
 		acc.AliasTotal = len(aliases)
 		acc.AliasActive = 0
@@ -787,35 +1092,6 @@ func validateHMESession(client *hme.Client) error {
 }
 
 // ---- 辅助函数 ----
-
-// deriveICloudEmail 从账号身份推导 iCloud 邮箱地址(用于 IMAP 登录)。
-//
-// 规则:
-//  1. primaryEmail 是 @icloud.com/@me.com/@mac.com → 直接用
-//  2. appleId 是上述域名 → 直接用
-//  3. appleId 是第三方邮箱(如 @qq.com) → 取 local part 拼 @icloud.com
-func deriveICloudEmail(info *hme.AccountInfo) string {
-	primary := strings.TrimSpace(info.PrimaryEmail)
-	appleID := strings.TrimSpace(info.AppleID)
-
-	if isICloudDomain(primary) {
-		return primary
-	}
-	if isICloudDomain(appleID) {
-		return appleID
-	}
-	if strings.Contains(appleID, "@") {
-		local := strings.SplitN(appleID, "@", 2)[0]
-		return local + "@icloud.com"
-	}
-	return firstNonEmpty(primary, appleID)
-}
-
-func isICloudDomain(email string) bool {
-	return email != "" && (strings.Contains(email, "@icloud.com") ||
-		strings.Contains(email, "@me.com") ||
-		strings.Contains(email, "@mac.com"))
-}
 
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
@@ -892,7 +1168,62 @@ func ensureAliasUsageLocked(acc *Account, alias hme.Alias, source string) *Alias
 	if usage.UsedBy == nil {
 		usage.UsedBy = make(map[string]string)
 	}
+	if usage.PendingCallers == nil {
+		usage.PendingCallers = make(map[string]*PendingCallerAllocation)
+	}
 	return usage
+}
+
+func markCallerAllocationLocked(usage *AliasUsage, caller string, now time.Time) {
+	if usage == nil {
+		return
+	}
+	caller = NormalizeCaller(caller)
+	if caller == "" {
+		return
+	}
+	if usage.UsedBy == nil {
+		usage.UsedBy = make(map[string]string)
+	}
+	usage.UsedBy[caller] = now.Format(time.RFC3339Nano)
+}
+
+func pendingCallerFor(values map[string]*PendingCallerAllocation, caller string) (string, *PendingCallerAllocation) {
+	for storedCaller, allocation := range values {
+		if NormalizeCaller(storedCaller) == caller {
+			return storedCaller, allocation
+		}
+	}
+	return "", nil
+}
+
+func deleteUsageCaller(values map[string]string, caller string) {
+	for storedCaller := range values {
+		if NormalizeCaller(storedCaller) == caller {
+			delete(values, storedCaller)
+		}
+	}
+}
+
+func expirePendingAliasCallersLocked(acc *Account, now time.Time) bool {
+	return expirePendingAliasCallersLockedCount(acc, now) > 0
+}
+
+func expirePendingAliasCallersLockedCount(acc *Account, now time.Time) int {
+	return 0
+}
+
+func parsePendingExpiry(value *PendingCallerAllocation) (time.Time, bool) {
+	if value == nil {
+		return time.Time{}, false
+	}
+	if expiresAt, ok := parseAnyTime(value.ExpiresAt); ok {
+		return expiresAt, true
+	}
+	if allocatedAt, ok := parseAnyTime(value.AllocatedAt); ok {
+		return allocatedAt.Add(callerTagConfirmationWindow), true
+	}
+	return time.Time{}, false
 }
 
 func countAliasUsages(acc *Account, activeOnly bool) int {
@@ -936,6 +1267,20 @@ func sortedUsageCallers(used map[string]string) []string {
 	callers := make([]string, 0, len(used))
 	for caller := range used {
 		callers = append(callers, caller)
+	}
+	sort.Strings(callers)
+	return callers
+}
+
+func sortedPendingCallers(pending map[string]*PendingCallerAllocation) []string {
+	if len(pending) == 0 {
+		return nil
+	}
+	callers := make([]string, 0, len(pending))
+	for caller := range pending {
+		if normalized := NormalizeCaller(caller); normalized != "" {
+			callers = append(callers, normalized)
+		}
 	}
 	sort.Strings(callers)
 	return callers
@@ -1007,7 +1352,40 @@ func cloneAliasUsageMap(values map[string]*AliasUsage) map[string]*AliasUsage {
 		}
 		cp := *value
 		cp.UsedBy = cloneStringMap(value.UsedBy)
+		cp.PendingCallers = clonePendingCallerMap(value.PendingCallers)
 		cloned[key] = &cp
 	}
 	return cloned
+}
+
+func clonePendingCallerMap(values map[string]*PendingCallerAllocation) map[string]*PendingCallerAllocation {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]*PendingCallerAllocation, len(values))
+	for key, value := range values {
+		if value == nil {
+			continue
+		}
+		cp := *value
+		cloned[key] = &cp
+	}
+	return cloned
+}
+
+func cloneMailReceiverConfig(value *MailReceiverConfig) *MailReceiverConfig {
+	if value == nil {
+		return nil
+	}
+	cp := *value
+	return &cp
+}
+
+func publicMailReceiverConfig(value *MailReceiverConfig) *MailReceiverConfig {
+	cp := cloneMailReceiverConfig(value)
+	if cp == nil {
+		return nil
+	}
+	cp.APIKey = ""
+	return cp
 }

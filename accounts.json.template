@@ -3,7 +3,7 @@
     {
       "id": "acc_1",
       "name": "主号",
-      "host": "imap.mail.me.com",
+      "host": "icloud.com",
       "proxy": "",
       "cookies": [
         {
@@ -33,12 +33,11 @@
           "value": "YOUR_WEBAUTH_TOKEN_HERE"
         }
       ],
-      "app_passwords": [
-        {
-          "icloud_email": "your_email@icloud.com",
-          "password": "xxxx-xxxx-xxxx-xxxx"
-        }
-      ]
+      "mail_receiver": {
+        "address": "your-forwarding-inbox@example.com",
+        "api_key": "your-moemail-api-key",
+        "base_url": "https://moemail.app"
+      }
     }
   ]
 }

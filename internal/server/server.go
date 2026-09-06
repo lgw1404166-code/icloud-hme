@@ -11,6 +11,8 @@ package server
 import (
 	"crypto/subtle"
 	"errors"
+	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -51,9 +53,11 @@ type Server struct {
 	poolStop              chan struct{}
 	poolLogMu             sync.Mutex
 	poolLogs              []aliasPoolLogEntry
-	imapMu                sync.Mutex
-	imapSessions          map[string]*imapSession
 	inboxCache            inboxCacheStore
+	receiverClientFactory func(*account.MailReceiverConfig) (receiverClient, error)
+	cleanupMu             sync.Mutex
+	cleanupCursors        map[string]string
+	pendingCallerStop     chan struct{}
 }
 
 // New 创建 Server。debug 为 true 时启用 Gin 调试日志。
@@ -74,8 +78,10 @@ func New(mgr *account.Manager, debug bool, apiKeys ...string) *Server {
 		createFailureCooldown: defaultCreateFailureCooldown,
 		relogin:               ReloginConfigFromEnv(),
 		poolConfig:            AliasPoolConfigFromEnv(),
-		imapSessions:          make(map[string]*imapSession),
 		inboxCache:            inboxCacheStore{entries: make(map[string]inboxCacheEntry)},
+		receiverClientFactory: newReceiverClient,
+		cleanupCursors:        make(map[string]string),
+		pendingCallerStop:     make(chan struct{}),
 	}
 	s.r = gin.Default() // 自带 Logger + Recovery 中间件
 	s.register()
@@ -84,7 +90,8 @@ func New(mgr *account.Manager, debug bool, apiKeys ...string) *Server {
 
 // Run 启动 HTTP 服务。
 func (s *Server) Run(addr string) error {
-	s.warmIMAPSessions()
+	s.startMailReceiverCleanupWorker()
+	s.startPendingCallerExpiryWorker()
 	return s.r.Run(addr)
 }
 
@@ -101,8 +108,12 @@ func (s *Server) register() {
 		api.GET("/accounts", s.listAccounts)
 		api.POST("/accounts", s.addAccount)
 		api.DELETE("/accounts/:id", s.removeAccount)
-		api.POST("/accounts/:id/password", s.setAppPassword)
+		api.PUT("/accounts/:id/mail-receiver", s.setMailReceiver)
+		api.DELETE("/accounts/:id/mail-receiver", s.clearMailReceiver)
+		api.POST("/accounts/:id/mail-receiver/cleanup", s.cleanupMailReceiver)
 		api.PUT("/accounts/:id/cookies", s.updateCookies)
+		api.PUT("/accounts/:id/enabled", s.setAccountEnabled)
+		api.PUT("/accounts/:id/auto-create", s.setAccountAutoCreate)
 
 		// ===== 核心接口 1: 创建邮箱 =====
 		api.POST("/create", s.createAlias)
@@ -115,6 +126,9 @@ func (s *Server) register() {
 		api.GET("/aliases", s.listAliases)
 		api.POST("/aliases/:id/deactivate", s.deactivateAlias)
 		api.POST("/aliases/:id/reactivate", s.reactivateAlias)
+		api.POST("/aliases/:id/callers", s.markAliasCaller)
+		api.POST("/aliases/release", s.releaseAliasCaller)
+		api.DELETE("/aliases/:id/callers/:caller", s.removeAliasCaller)
 		api.DELETE("/aliases/:id", s.deleteAlias)
 
 		// ===== 系统 =====
@@ -178,6 +192,9 @@ func failCreate(c *gin.Context, code int, msg string, httpErr *hme.HTTPError, re
 //   POST /api/create
 //   body: {"account_id": "acc_xxx", "caller": "chatgpt"}
 //   返回: 本地别名池中尚未被该 caller 领取过的 HME 邮箱地址
+//
+// account_id is optional. When omitted, the server atomically selects an
+// available alias across all enabled accounts and returns its owning account.
 // ====================================================================
 
 type createReq struct {
@@ -195,35 +212,44 @@ func (s *Server) createAlias(c *gin.Context) {
 		fail(c, http.StatusBadRequest, "参数错误: 请求体必须是 JSON — "+err.Error())
 		return
 	}
-	accountID, status, err := s.resolveCreateAccountID(req.AccountID)
-	if err != nil {
-		fail(c, status, err.Error())
-		return
-	}
-	req.AccountID = accountID
-
 	caller := account.NormalizeCaller(firstNonEmptyString(req.Caller, req.Client, req.Identity))
 	if caller == "" {
 		fail(c, http.StatusBadRequest, "参数缺失: caller（调用方身份字符串，例如 chatgpt、moxt）")
 		return
 	}
-
-	alias, err := s.mgr.AcquireAlias(req.AccountID, caller)
-	if err != nil {
-		// 本地池没有可领别名时，先同步一次 Apple 侧列表，避免刚启动时本地记录为空。
-		if syncErr := s.syncAliases(req.AccountID); syncErr != nil {
-			if isSessionError(syncErr.Error()) {
-				s.mgr.MarkLoginRequired(req.AccountID, syncErr)
-				fail(c, http.StatusUnauthorized, "Apple 登录态已过期，请在管理页面重新登录并更新 Cookie: "+syncErr.Error())
-				return
-			}
-			fail(c, http.StatusConflict, err.Error()+"；同步 Apple 别名列表失败: "+syncErr.Error())
-			return
-		}
-		alias, err = s.mgr.AcquireAlias(req.AccountID, caller)
+	accountID := strings.TrimSpace(req.AccountID)
+	var alias *hme.Alias
+	var err error
+	if accountID == "" {
+		accountID, alias, err = s.acquireAliasAcrossAccounts(caller)
 		if err != nil {
 			fail(c, http.StatusConflict, err.Error())
 			return
+		}
+	} else {
+		var status int
+		accountID, status, err = s.resolveCreateAccountID(accountID)
+		if err != nil {
+			fail(c, status, err.Error())
+			return
+		}
+		alias, err = s.mgr.AcquireAlias(accountID, caller)
+		if err != nil {
+			// 本地池没有可领别名时，先同步一次 Apple 侧列表，避免刚启动时本地记录为空。
+			if syncErr := s.syncAliases(accountID); syncErr != nil {
+				if isSessionError(syncErr.Error()) {
+					s.mgr.MarkLoginRequired(accountID, syncErr)
+					fail(c, http.StatusUnauthorized, "Apple 登录态已过期，请在管理页面重新登录并更新 Cookie: "+syncErr.Error())
+					return
+				}
+				fail(c, http.StatusConflict, err.Error()+"；同步 Apple 别名列表失败: "+syncErr.Error())
+				return
+			}
+			alias, err = s.mgr.AcquireAlias(accountID, caller)
+			if err != nil {
+				fail(c, http.StatusConflict, err.Error())
+				return
+			}
 		}
 	}
 
@@ -235,11 +261,29 @@ func (s *Server) createAlias(c *gin.Context) {
 		"caller":      caller,
 		"used_by":     alias.UsedBy,
 		"protocol":    "local_pool",
-		"account_id":  req.AccountID,
+		"account_id":  accountID,
 	})
 }
 
+func (s *Server) acquireAliasAcrossAccounts(caller string) (string, *hme.Alias, error) {
+	accountID, alias, err := s.mgr.AcquireAliasAny(caller)
+	if err == nil {
+		return accountID, alias, nil
+	}
+
+	// `/api/create` is intentionally a local-pool allocation endpoint.  Do not
+	// synchronously refresh every Apple account here when the pool is empty:
+	// those upstream calls can take tens of seconds, exceed callers' request
+	// deadlines, and may still reserve an alias after the caller has given up.
+	// The alias-pool worker is the only component that talks to Apple to refill
+	// inventory, so an empty pool is returned promptly as a normal 409 response.
+	return "", nil, err
+}
+
 func (s *Server) syncAliases(accountID string) error {
+	if err := s.mgr.EnsureEnabled(accountID); err != nil {
+		return err
+	}
 	client, err := s.mgr.HMEClient(accountID, false)
 	if err != nil {
 		return err
@@ -254,9 +298,18 @@ func (s *Server) syncAliases(accountID string) error {
 
 func (s *Server) resolveCreateAccountID(accountID string) (string, int, error) {
 	if accountID = strings.TrimSpace(accountID); accountID != "" {
+		if acc, ok := s.mgr.GetAccount(accountID); ok && !acc.Enabled {
+			return "", http.StatusConflict, fmt.Errorf("账号已停用，无法领取别名: %s", accountID)
+		}
 		return accountID, 0, nil
 	}
-	accounts := s.mgr.ListAccounts()
+	allAccounts := s.mgr.ListAccounts()
+	accounts := make([]*account.Account, 0, len(allAccounts))
+	for _, acc := range allAccounts {
+		if acc != nil && acc.Enabled {
+			accounts = append(accounts, acc)
+		}
+	}
 	switch len(accounts) {
 	case 0:
 		return "", http.StatusNotFound, errors.New("没有可用的 iCloud 账号")
@@ -362,9 +415,8 @@ func firstNonEmptyString(values ...string) string {
 //   - 不传 alias: 返回指定邮件夹最近邮件
 //   - 传 alias:   在指定邮件夹中查找发给该 HME 别名的邮件
 //
-//   认证优先级: IMAP (App Password) 优先 > Web API (Cookie) 回退
-//   - IMAP: 支持服务端按收件人搜索 (FindByRecipient)
-//   - Web API: 不支持收件人搜索,拉取收件箱后本地按别名过滤 (FindByAlias)
+//   读取方式: 账号配置的 MoeMail 转发收件箱 API。
+//   Apple Cookie 只管理 HME 别名，不再用于读取 iCloud Mail。
 // ====================================================================
 
 func (s *Server) listInbox(c *gin.Context) {
@@ -374,6 +426,7 @@ func (s *Server) listInbox(c *gin.Context) {
 		return
 	}
 	alias := strings.TrimSpace(c.Query("alias"))
+	caller := account.NormalizeCaller(firstNonEmptyString(c.Query("caller"), c.Query("client"), c.Query("identity")))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
 	if limit <= 0 || limit > 100 {
 		limit = 20
@@ -389,136 +442,69 @@ func (s *Server) listInbox(c *gin.Context) {
 		fail(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	if alias == "" {
+		fail(c, http.StatusBadRequest, "参数缺失: alias；共享转发收件箱必须指定 iCloud 别名")
+		return
+	}
+	if err := s.mgr.EnsureEnabled(accountID); err != nil {
+		fail(c, accountErrorStatus(err), err.Error())
+		return
+	}
+	if folder == mail.FolderJunk {
+		fail(c, http.StatusBadRequest, "MoeMail 收件 API 不区分垃圾邮件文件夹，请使用 folder=all 或 inbox")
+		return
+	}
 	cacheKey := ""
-	if alias != "" {
-		cacheKey = inboxCacheKey(accountID, alias, folder, limit, page, days)
-		forceRefresh := c.Query("refresh") == "1" || strings.EqualFold(c.Query("refresh"), "true")
-		if !forceRefresh {
-			if cachedMessages, cachedTotal, found := s.getInboxCache(cacheKey); found {
-				ok(c, gin.H{
-					"account_id":  accountID,
-					"alias":       alias,
-					"folder":      folder,
-					"page":        page,
-					"per_page":    limit,
-					"count":       len(cachedMessages),
-					"total":       cachedTotal,
-					"total_pages": totalPages(cachedTotal, limit),
-					"messages":    cachedMessages,
-					"method":      "imap_cache",
-				})
-				return
-			}
+	cacheKey = inboxCacheKey(accountID, alias, folder, limit, page, days)
+	forceRefresh := c.Query("refresh") == "1" || strings.EqualFold(c.Query("refresh"), "true")
+	if !forceRefresh {
+		if cachedMessages, cachedTotal, found := s.getInboxCache(cacheKey); found {
+			s.observeCallerInboxRead(accountID, alias, caller, len(cachedMessages) > 0)
+			ok(c, gin.H{
+				"account_id":  accountID,
+				"alias":       alias,
+				"folder":      folder,
+				"page":        page,
+				"per_page":    limit,
+				"count":       len(cachedMessages),
+				"total":       cachedTotal,
+				"total_pages": totalPages(cachedTotal, limit),
+				"messages":    cachedMessages,
+				"method":      "receiver_api_cache",
+			})
+			return
 		}
 	}
-
-	// 优先使用 IMAP (App Password 认证)
-	var messages []mail.Message
-	var total int
-	var imapErr error
-	if alias != "" && folder == mail.FolderAll {
-		messages, total, imapErr = s.findAliasInAllFolders(accountID, alias, limit, offset, days)
-	} else {
-		slot := "default"
-		if alias != "" {
-			slot = folder
-		}
-		imapErr = s.withMailClientSlot(accountID, slot, func(mc *mail.Client) error {
-			if alias != "" {
-				var queryErr error
-				messages, total, queryErr = mc.FindByRecipientPage(alias, folder, limit, offset, days)
-				return queryErr
-			}
-			fetched, queryErr := mc.ListMessages(folder, offset+limit, days)
-			if queryErr != nil {
-				return queryErr
-			}
-			total = len(fetched)
-			messages = pageMessages(fetched, offset, limit)
-			return nil
-		})
-	}
-	if imapErr == nil {
-		if cacheKey != "" {
-			s.setInboxCache(cacheKey, messages, total)
-		}
-		ok(c, gin.H{
-			"account_id":  accountID,
-			"alias":       alias,
-			"folder":      folder,
-			"page":        page,
-			"per_page":    limit,
-			"count":       len(messages),
-			"total":       total,
-			"total_pages": totalPages(total, limit),
-			"messages":    messages,
-			"method":      "imap",
-		})
-		return
-	}
-	if folder != mail.FolderInbox {
-		message := "查询全部邮件和垃圾邮件需要可用的 iCloud IMAP App Password"
-		if imapErr != nil {
-			message += ": " + imapErr.Error()
-		}
-		fail(c, http.StatusFailedDependency, message)
-		return
-	}
-
-	// Web API 只支持 INBOX，因此仅在 folder=inbox 时回退。
-	wmc, err := s.mgr.WebMailClient(accountID)
+	receiverConfig, err := s.mgr.MailReceiver(accountID)
 	if err != nil {
-		fail(c, http.StatusFailedDependency, inboxClientError(imapErr, err))
+		fail(c, http.StatusFailedDependency, err.Error())
 		return
 	}
-
-	if alias != "" {
-		messages, err := wmc.FindByAlias(alias, offset+limit)
-		if err != nil {
-			fail(c, http.StatusFailedDependency, inboxClientError(imapErr, err))
-			return
-		}
-		setMessagesFolder(messages, mail.FolderInbox)
-		total := len(messages)
-		messages = pageMessages(messages, offset, limit)
-		ok(c, gin.H{
-			"account_id":  accountID,
-			"alias":       alias,
-			"folder":      folder,
-			"page":        page,
-			"per_page":    limit,
-			"count":       len(messages),
-			"total":       total,
-			"total_pages": totalPages(total, limit),
-			"messages":    messages,
-			"method":      "web_api",
-		})
-	} else {
-		messages, err := wmc.ListInbox(offset + limit)
-		if err != nil {
-			fail(c, http.StatusFailedDependency, inboxClientError(imapErr, err))
-			return
-		}
-		setMessagesFolder(messages, mail.FolderInbox)
-		total := len(messages)
-		messages = pageMessages(messages, offset, limit)
-		ok(c, gin.H{
-			"account_id":  accountID,
-			"folder":      folder,
-			"page":        page,
-			"per_page":    limit,
-			"count":       len(messages),
-			"total":       total,
-			"total_pages": totalPages(total, limit),
-			"messages":    messages,
-			"method":      "web_api",
-		})
+	receiver, err := s.receiverClientFactory(normalizeMailReceiver(receiverConfig))
+	if err != nil {
+		fail(c, http.StatusFailedDependency, err.Error())
+		return
 	}
+	messages, total, err := receiver.List(c.Request.Context(), alias, limit, offset, days)
+	if err != nil {
+		fail(c, http.StatusFailedDependency, "读取转发收件箱失败: "+err.Error())
+		return
+	}
+	s.setInboxCache(cacheKey, messages, total)
+	s.observeCallerInboxRead(accountID, alias, caller, len(messages) > 0)
+	ok(c, gin.H{
+		"account_id": accountID, "alias": alias, "folder": folder, "page": page,
+		"per_page": limit, "count": len(messages), "total": total,
+		"total_pages": totalPages(total, limit), "messages": messages,
+		"method": "moemail_api",
+	})
 }
 
 func (s *Server) getInboxMessage(c *gin.Context) {
 	accountID := c.Query("account_id")
 	messageID := strings.TrimSpace(c.Query("id"))
+	alias := strings.TrimSpace(c.Query("alias"))
+	caller := account.NormalizeCaller(firstNonEmptyString(c.Query("caller"), c.Query("client"), c.Query("identity")))
 	if accountID == "" {
 		fail(c, http.StatusBadRequest, "参数缺失: account_id")
 		return
@@ -527,57 +513,43 @@ func (s *Server) getInboxMessage(c *gin.Context) {
 		fail(c, http.StatusBadRequest, "参数缺失: id")
 		return
 	}
-
-	var full *mail.FullMessage
-	slot := strings.ToLower(strings.TrimSpace(strings.SplitN(messageID, ":", 2)[0]))
-	if slot != mail.FolderInbox && slot != mail.FolderJunk {
-		slot = "default"
-	}
-	imapErr := s.withMailClientSlot(accountID, slot, func(mc *mail.Client) error {
-		var fetchErr error
-		full, fetchErr = mc.GetFullByID(messageID)
-		return fetchErr
-	})
-	if imapErr == nil {
-		ok(c, gin.H{
-			"account_id": accountID,
-			"message":    full,
-			"method":     "imap",
-		})
+	if alias == "" {
+		fail(c, http.StatusBadRequest, "参数缺失: alias")
 		return
 	}
-
-	wmc, webErr := s.mgr.WebMailClient(accountID)
-	if webErr == nil {
-		full, err := wmc.GetFull(messageID)
-		if err == nil {
-			ok(c, gin.H{
-				"account_id": accountID,
-				"message":    full,
-				"method":     "web_api",
-			})
-			return
-		}
-		webErr = err
+	if err := s.mgr.EnsureEnabled(accountID); err != nil {
+		fail(c, accountErrorStatus(err), err.Error())
+		return
 	}
-	fail(c, http.StatusFailedDependency, inboxClientError(imapErr, webErr))
+	receiverConfig, err := s.mgr.MailReceiver(accountID)
+	if err != nil {
+		fail(c, http.StatusFailedDependency, err.Error())
+		return
+	}
+	receiver, err := s.receiverClientFactory(normalizeMailReceiver(receiverConfig))
+	if err != nil {
+		fail(c, http.StatusFailedDependency, err.Error())
+		return
+	}
+	full, err := receiver.Get(c.Request.Context(), alias, messageID)
+	if err != nil {
+		fail(c, http.StatusFailedDependency, "读取转发收件箱邮件正文失败: "+err.Error())
+		return
+	}
+	s.observeCallerInboxRead(accountID, alias, caller, full != nil)
+	ok(c, gin.H{"account_id": accountID, "message": full, "method": "moemail_api"})
 }
 
-func setMessagesFolder(messages []mail.Message, folder string) {
-	for i := range messages {
-		messages[i].Folder = folder
+// observeCallerInboxRead deliberately never makes a mail read fail: the
+// caller's response is already valid, while confirmation bookkeeping can be
+// retried by the next caller request or expiry sweep.
+func (s *Server) observeCallerInboxRead(accountID, alias, caller string, hasMail bool) {
+	if caller == "" || alias == "" {
+		return
 	}
-}
-
-func pageMessages(messages []mail.Message, offset, limit int) []mail.Message {
-	if offset >= len(messages) || limit <= 0 {
-		return []mail.Message{}
+	if _, err := s.mgr.ObserveCallerInboxRead(accountID, alias, caller, hasMail); err != nil {
+		log.Printf("caller tag observation failed account_id=%s alias=%s caller=%s: %v", accountID, alias, caller, err)
 	}
-	end := offset + limit
-	if end > len(messages) {
-		end = len(messages)
-	}
-	return messages[offset:end]
 }
 
 func totalPages(total, perPage int) int {
@@ -587,28 +559,24 @@ func totalPages(total, perPage int) int {
 	return (total + perPage - 1) / perPage
 }
 
-func inboxClientError(imapErr, webErr error) string {
-	if imapErr != nil {
-		message := strings.ToLower(imapErr.Error())
-		if strings.Contains(message, "app") && strings.Contains(message, "密码") {
-			return "当前账号未设置或未能使用 App 专用密码，且 Cookie Web 邮件接口不可用。请在账号列表点击钥匙图标设置 App Password 后重试。"
-		}
-	}
-	if webErr != nil {
-		return "读取邮件失败: " + webErr.Error()
-	}
-	if imapErr != nil {
-		return "读取邮件失败: " + imapErr.Error()
-	}
-	return "读取邮件失败: 未知错误"
-}
-
 // ====================================================================
 // 辅助接口
 // ====================================================================
 
 func (s *Server) listAccounts(c *gin.Context) {
-	ok(c, s.mgr.ListAccounts())
+	accounts := s.mgr.ListAccounts()
+	includeDisabled := c.Query("include_disabled") == "1" || strings.EqualFold(c.Query("include_disabled"), "true")
+	if includeDisabled {
+		ok(c, accounts)
+		return
+	}
+	enabledAccounts := make([]*account.Account, 0, len(accounts))
+	for _, acc := range accounts {
+		if acc != nil && acc.Enabled {
+			enabledAccounts = append(enabledAccounts, acc)
+		}
+	}
+	ok(c, enabledAccounts)
 }
 
 type addAccountReq struct {
@@ -632,7 +600,7 @@ func (s *Server) addAccount(c *gin.Context) {
 	// 返回脱敏副本，不能修改 Manager 持有的账号对象。
 	publicAccount := *acc
 	publicAccount.Cookies = nil
-	publicAccount.AppPassword = ""
+	publicAccount.MailReceiver = nil
 	publicAccount.HMEClientID = ""
 	c.JSON(http.StatusCreated, apiResp{Success: true, Data: &publicAccount})
 }
@@ -643,28 +611,121 @@ func (s *Server) removeAccount(c *gin.Context) {
 		fail(c, http.StatusNotFound, "账号不存在")
 		return
 	}
-	s.closeIMAPSession(id)
+	s.clearInboxCache(id)
 	ok(c, gin.H{"id": id})
 }
 
-type setPwdReq struct {
-	ICloudEmail string `json:"icloud_email" binding:"required"`
-	AppPassword string `json:"app_password" binding:"required"`
+type setMailReceiverReq struct {
+	Provider                string `json:"provider"`
+	BaseURL                 string `json:"base_url"`
+	Address                 string `json:"address" binding:"required"`
+	MailboxID               string `json:"mailbox_id"`
+	APIKey                  string `json:"api_key" binding:"required"`
+	CleanupEnabled          *bool  `json:"cleanup_enabled"`
+	CleanupRetentionMinutes int    `json:"cleanup_retention_minutes"`
 }
 
-func (s *Server) setAppPassword(c *gin.Context) {
+func (s *Server) setMailReceiver(c *gin.Context) {
 	id := c.Param("id")
-	var req setPwdReq
+	var req setMailReceiverReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, http.StatusBadRequest, "参数错误: icloud_email, app_password 必填 — "+err.Error())
+		fail(c, http.StatusBadRequest, "参数错误: address、api_key 必填 — "+err.Error())
 		return
 	}
-	if err := s.mgr.SetAppPassword(id, req.ICloudEmail, req.AppPassword); err != nil {
+	if provider := strings.TrimSpace(req.Provider); provider != "" && !strings.EqualFold(provider, "moemail") {
+		fail(c, http.StatusBadRequest, "转发收件箱仅支持 MoeMail，不接受 provider="+provider)
+		return
+	}
+	previous, _ := s.mgr.MailReceiver(id)
+	receiver := normalizeMailReceiver(&account.MailReceiverConfig{
+		BaseURL: req.BaseURL, Address: req.Address,
+		MailboxID: req.MailboxID, APIKey: req.APIKey,
+	})
+	if previous != nil {
+		receiver.CleanupEnabled = previous.CleanupEnabled
+		receiver.CleanupRetentionSeconds = previous.CleanupRetentionSeconds
+	}
+	if req.CleanupEnabled != nil {
+		receiver.CleanupEnabled = *req.CleanupEnabled
+	}
+	if req.CleanupRetentionMinutes > 0 {
+		receiver.CleanupRetentionSeconds = req.CleanupRetentionMinutes * 60
+	}
+	if err := validateMailReceiver(receiver); err != nil {
 		fail(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.closeIMAPSession(id)
-	ok(c, gin.H{"id": id, "icloud_email": req.ICloudEmail})
+	client, err := s.receiverClientFactory(receiver)
+	if err != nil {
+		fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := client.Validate(c.Request.Context()); err != nil {
+		fail(c, http.StatusFailedDependency, "转发收件箱验证失败，配置未保存: "+err.Error())
+		return
+	}
+	if err := s.mgr.SetMailReceiver(id, receiver); err != nil {
+		if strings.Contains(err.Error(), "账号不存在") {
+			fail(c, http.StatusNotFound, err.Error())
+		} else {
+			fail(c, http.StatusInternalServerError, "保存转发收件箱配置失败: "+err.Error())
+		}
+		return
+	}
+	s.clearInboxCache(id)
+	public := *receiver
+	public.APIKey = ""
+	ok(c, gin.H{"id": id, "mail_receiver": public})
+}
+
+func (s *Server) cleanupMailReceiver(c *gin.Context) {
+	id := c.Param("id")
+	receiverConfig, err := s.mgr.MailReceiver(id)
+	if err != nil {
+		fail(c, accountErrorStatus(err), err.Error())
+		return
+	}
+	receiverConfig = normalizeMailReceiver(receiverConfig)
+	if err := validateMailReceiver(receiverConfig); err != nil {
+		fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	retention := time.Duration(receiverConfig.CleanupRetentionSeconds) * time.Second
+	if retention <= 0 {
+		fail(c, http.StatusConflict, "转发收件箱未启用自动清理或未设置保留期")
+		return
+	}
+	receiver, err := s.receiverClientFactory(receiverConfig)
+	if err != nil {
+		fail(c, http.StatusFailedDependency, err.Error())
+		return
+	}
+	cursor := s.cleanupCursor(id)
+	result, err := cleanupMoEmailReceiver(c.Request.Context(), receiver, retention, cursor, 25)
+	if err != nil {
+		fail(c, http.StatusFailedDependency, "清理 MoeMail 历史邮件失败: "+err.Error())
+		return
+	}
+	s.setCleanupCursor(id, result.NextCursor)
+	s.clearInboxCache(id)
+	ok(c, gin.H{
+		"id": id, "deleted": result.Deleted, "scanned": result.Scanned,
+		"next_cursor": result.NextCursor, "retention_seconds": int64(retention / time.Second),
+	})
+}
+
+func (s *Server) clearMailReceiver(c *gin.Context) {
+	id := c.Param("id")
+	if err := s.mgr.SetMailReceiver(id, nil); err != nil {
+		if strings.Contains(err.Error(), "账号不存在") {
+			fail(c, http.StatusNotFound, err.Error())
+		} else {
+			fail(c, http.StatusInternalServerError, "清除转发收件箱配置失败: "+err.Error())
+		}
+		return
+	}
+	s.clearInboxCache(id)
+	ok(c, gin.H{"id": id, "mail_receiver": nil})
 }
 
 type updateCookiesReq struct {
@@ -685,15 +746,62 @@ func (s *Server) updateCookies(c *gin.Context) {
 	ok(c, gin.H{"id": id, "cookies_count": len(req.Cookies)})
 }
 
+type accountAutoCreateReq struct {
+	Enabled *bool `json:"enabled" binding:"required"`
+}
+
+func (s *Server) setAccountEnabled(c *gin.Context) {
+	id := c.Param("id")
+	var req accountAutoCreateReq
+	if err := c.ShouldBindJSON(&req); err != nil || req.Enabled == nil {
+		fail(c, http.StatusBadRequest, "参数错误: enabled 必须是布尔值")
+		return
+	}
+	if err := s.mgr.SetEnabled(id, *req.Enabled); err != nil {
+		if strings.Contains(err.Error(), "账号不存在") {
+			fail(c, http.StatusNotFound, err.Error())
+		} else {
+			fail(c, http.StatusInternalServerError, "保存账号启用开关失败: "+err.Error())
+		}
+		return
+	}
+	if !*req.Enabled {
+		s.clearInboxCache(id)
+	}
+	ok(c, gin.H{"id": id, "enabled": *req.Enabled})
+}
+
+func (s *Server) setAccountAutoCreate(c *gin.Context) {
+	id := c.Param("id")
+	var req accountAutoCreateReq
+	if err := c.ShouldBindJSON(&req); err != nil || req.Enabled == nil {
+		fail(c, http.StatusBadRequest, "参数错误: enabled 必须是布尔值")
+		return
+	}
+	if err := s.mgr.SetAutoCreateEnabled(id, *req.Enabled); err != nil {
+		if strings.Contains(err.Error(), "账号不存在") {
+			fail(c, http.StatusNotFound, err.Error())
+		} else {
+			fail(c, http.StatusInternalServerError, "保存账号自动创建开关失败: "+err.Error())
+		}
+		return
+	}
+	ok(c, gin.H{"id": id, "enabled": *req.Enabled})
+}
+
 func (s *Server) listAliases(c *gin.Context) {
 	accountID := c.Query("account_id")
 	if accountID == "" {
 		fail(c, http.StatusBadRequest, "参数缺失: account_id")
 		return
 	}
+	if err := s.mgr.EnsureEnabled(accountID); err != nil {
+		fail(c, accountErrorStatus(err), err.Error())
+		return
+	}
 	client, err := s.mgr.HMEClient(accountID, false)
 	if err != nil {
-		fail(c, http.StatusNotFound, err.Error())
+		fail(c, accountErrorStatus(err), err.Error())
 		return
 	}
 	aliases, err := client.ListAliases()
@@ -723,6 +831,105 @@ type aliasActionReq struct {
 	AccountID string `json:"account_id" binding:"required"`
 }
 
+type aliasCallerReleaseReq struct {
+	AccountID   string `json:"account_id" binding:"required"`
+	AnonymousID string `json:"anonymous_id" binding:"required"`
+	Caller      string `json:"caller" binding:"required"`
+}
+
+type aliasCallerMarkReq struct {
+	AccountID string `json:"account_id" binding:"required"`
+	Caller    string `json:"caller" binding:"required"`
+}
+
+// markAliasCaller repairs caller bookkeeping for an alias that was already
+// registered outside the current allocation flow. It does not change or
+// delete the Apple alias; it only persists the local caller tag.
+func (s *Server) markAliasCaller(c *gin.Context) {
+	anonymousID := strings.TrimSpace(c.Param("id"))
+	var req aliasCallerMarkReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, "参数错误: account_id 和 caller 必填 — "+err.Error())
+		return
+	}
+	caller := account.NormalizeCaller(req.Caller)
+	if anonymousID == "" || strings.TrimSpace(req.AccountID) == "" || caller == "" {
+		fail(c, http.StatusBadRequest, "参数错误: account_id、anonymousId 和 caller 必填")
+		return
+	}
+	alias, err := s.mgr.MarkAliasCaller(req.AccountID, anonymousID, caller)
+	if err != nil {
+		if strings.Contains(err.Error(), "不存在") {
+			fail(c, http.StatusNotFound, err.Error())
+		} else {
+			fail(c, http.StatusInternalServerError, "更新调用方标签失败: "+err.Error())
+		}
+		return
+	}
+	ok(c, gin.H{
+		"account_id":  strings.TrimSpace(req.AccountID),
+		"anonymousId": alias.AnonymousID,
+		"email":       alias.Email,
+		"caller":      caller,
+		"used_by":     alias.UsedBy,
+	})
+}
+
+// releaseAliasCaller is the generic caller-facing release endpoint. A caller
+// uses it after a definite business failure to make a permanently claimed
+// alias eligible for that same caller again.
+func (s *Server) releaseAliasCaller(c *gin.Context) {
+	var req aliasCallerReleaseReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, "参数错误: account_id、anonymous_id 和 caller 必填 — "+err.Error())
+		return
+	}
+	s.respondAliasCallerRelease(c, req.AccountID, req.AnonymousID, req.Caller)
+}
+
+func (s *Server) removeAliasCaller(c *gin.Context) {
+	anonymousID := strings.TrimSpace(c.Param("id"))
+	caller := account.NormalizeCaller(c.Param("caller"))
+	var req aliasActionReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, "参数错误: account_id 必填 — "+err.Error())
+		return
+	}
+	if anonymousID == "" || caller == "" {
+		fail(c, http.StatusBadRequest, "参数错误: anonymousId 和 caller 必填")
+		return
+	}
+	s.respondAliasCallerRelease(c, req.AccountID, anonymousID, caller)
+}
+
+func (s *Server) respondAliasCallerRelease(c *gin.Context, accountID, anonymousID, caller string) {
+	accountID = strings.TrimSpace(accountID)
+	anonymousID = strings.TrimSpace(anonymousID)
+	caller = account.NormalizeCaller(caller)
+	if accountID == "" || anonymousID == "" || caller == "" {
+		fail(c, http.StatusBadRequest, "参数错误: account_id、anonymous_id 和 caller 必填")
+		return
+	}
+	alias, err := s.mgr.RemoveAliasCaller(accountID, anonymousID, caller)
+	if err != nil {
+		if strings.Contains(err.Error(), "不存在") || strings.Contains(err.Error(), "没有调用方记录") {
+			fail(c, http.StatusNotFound, err.Error())
+		} else if strings.Contains(err.Error(), "账号已停用") {
+			fail(c, http.StatusConflict, err.Error())
+		} else {
+			fail(c, http.StatusInternalServerError, "删除调用方记录失败: "+err.Error())
+		}
+		return
+	}
+	ok(c, gin.H{
+		"account_id":  accountID,
+		"anonymousId": alias.AnonymousID,
+		"email":       alias.Email,
+		"caller":      caller,
+		"used_by":     alias.UsedBy,
+	})
+}
+
 func (s *Server) deactivateAlias(c *gin.Context) {
 	anonymousID := c.Param("id")
 	var req aliasActionReq
@@ -733,7 +940,7 @@ func (s *Server) deactivateAlias(c *gin.Context) {
 
 	client, err := s.mgr.HMEClient(req.AccountID, false)
 	if err != nil {
-		fail(c, http.StatusNotFound, err.Error())
+		fail(c, accountErrorStatus(err), err.Error())
 		return
 	}
 
@@ -742,6 +949,11 @@ func (s *Server) deactivateAlias(c *gin.Context) {
 	if err != nil {
 		fail(c, http.StatusBadGateway, "停用失败: "+err.Error())
 		return
+	}
+	if success {
+		if statsErr := s.mgr.SetAliasActive(req.AccountID, anonymousID, false); statsErr != nil {
+			log.Printf("保存别名停用状态失败 account_id=%s anonymous_id=%s: %v", req.AccountID, anonymousID, statsErr)
+		}
 	}
 	ok(c, gin.H{"anonymous_id": anonymousID, "success": success})
 }
@@ -756,7 +968,7 @@ func (s *Server) reactivateAlias(c *gin.Context) {
 
 	client, err := s.mgr.HMEClient(req.AccountID, false)
 	if err != nil {
-		fail(c, http.StatusNotFound, err.Error())
+		fail(c, accountErrorStatus(err), err.Error())
 		return
 	}
 
@@ -765,6 +977,11 @@ func (s *Server) reactivateAlias(c *gin.Context) {
 	if err != nil {
 		fail(c, http.StatusBadGateway, "激活失败: "+err.Error())
 		return
+	}
+	if success {
+		if statsErr := s.mgr.SetAliasActive(req.AccountID, anonymousID, true); statsErr != nil {
+			log.Printf("保存别名激活状态失败 account_id=%s anonymous_id=%s: %v", req.AccountID, anonymousID, statsErr)
+		}
 	}
 	ok(c, gin.H{"anonymous_id": anonymousID, "success": success})
 }
@@ -779,7 +996,7 @@ func (s *Server) deleteAlias(c *gin.Context) {
 
 	client, err := s.mgr.HMEClient(req.AccountID, false)
 	if err != nil {
-		fail(c, http.StatusNotFound, err.Error())
+		fail(c, accountErrorStatus(err), err.Error())
 		return
 	}
 
@@ -789,6 +1006,9 @@ func (s *Server) deleteAlias(c *gin.Context) {
 		return
 	}
 	_ = s.mgr.SaveCookies(req.AccountID, client.Cookies)
+	if statsErr := s.mgr.MarkAliasDeleted(req.AccountID, anonymousID); statsErr != nil {
+		log.Printf("保存别名删除状态失败 account_id=%s anonymous_id=%s: %v", req.AccountID, anonymousID, statsErr)
+	}
 	ok(c, gin.H{"anonymous_id": anonymousID})
 }
 
@@ -801,12 +1021,25 @@ func isSessionError(msg string) bool {
 		strings.Contains(m, "会话校验失败")
 }
 
+func accountErrorStatus(err error) int {
+	if err == nil {
+		return http.StatusInternalServerError
+	}
+	if strings.Contains(err.Error(), "账号不存在") {
+		return http.StatusNotFound
+	}
+	if strings.Contains(err.Error(), "账号已停用") {
+		return http.StatusConflict
+	}
+	return http.StatusBadRequest
+}
+
 // reloadConfig 重新加载 accounts.json 配置文件。
 func (s *Server) reloadConfig(c *gin.Context) {
 	if err := s.mgr.Reload(); err != nil {
 		fail(c, http.StatusInternalServerError, "重新加载配置失败: "+err.Error())
 		return
 	}
-	s.closeAllIMAPSessions()
+	s.clearInboxCache("")
 	ok(c, gin.H{"message": "配置已重新加载"})
 }

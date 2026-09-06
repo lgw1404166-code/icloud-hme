@@ -102,7 +102,13 @@
   }
 
   function accountLabel(account) {
-    return account?.icloud_email || account?.real_email || account?.id || "iCloud 账号";
+    return account?.real_email || account?.name || account?.id || "iCloud 账号";
+  }
+
+  function receiverSummary(account) {
+    const receiver = account?.mail_receiver;
+    if (!receiver?.address) return "未配置";
+    return `MoeMail · ${receiver.address}`;
   }
 
   async function request(path, options = {}) {
@@ -170,6 +176,7 @@
   }
 
   function accountStatus(account) {
+    if (account.enabled === false) return { label: "已停用", className: "status-inactive" };
     const status = String(account.status || "pending").toLowerCase();
     if (status === "active") return { label: "正常", className: "status-active" };
     if (status === "error") return { label: "异常", className: "status-error" };
@@ -177,7 +184,7 @@
   }
 
   function renderAccountMetrics() {
-    const active = state.accounts.filter((account) => account.status === "active").length;
+    const active = state.accounts.filter((account) => account.enabled !== false && account.status === "active").length;
     const aliases = state.accounts.reduce((sum, account) => sum + Number(account.alias_active || 0), 0);
     $("#metric-accounts").textContent = state.accounts.length;
     $("#metric-active").textContent = active;
@@ -196,7 +203,8 @@
 
     body.innerHTML = state.accounts.map((account) => {
       const status = accountStatus(account);
-      const email = account.icloud_email || account.real_email || account.id;
+      const accountEnabled = account.enabled !== false;
+      const autoCreateEnabled = account.auto_create_enabled !== false;
       const errorTitle = account.last_error ? ` title="${escapeHTML(account.last_error)}"` : "";
       return `
         <tr>
@@ -212,12 +220,24 @@
           <td data-label="状态"><span class="status-badge ${status.className}"${errorTitle}>${status.label}</span></td>
           <td data-label="域"><span class="cell-secondary">${escapeHTML(account.host || "icloud.com")}</span></td>
           <td data-label="别名"><span>${Number(account.alias_active || 0)} / ${Number(account.alias_total || 0)}</span></td>
+          <td data-label="转发收件箱"><span class="cell-secondary account-email">${escapeHTML(receiverSummary(account))}</span></td>
+          <td data-label="账号启用">
+            <button class="account-toggle ${accountEnabled ? "is-on" : "is-off"}" type="button" data-action="toggle-account-enabled" data-id="${escapeHTML(account.id)}" data-enabled="${accountEnabled}" role="switch" aria-checked="${accountEnabled}" title="${accountEnabled ? "停用该账号全部功能" : "启用该账号全部功能"}" aria-label="${accountEnabled ? "停用该账号全部功能" : "启用该账号全部功能"}">
+              <span class="account-toggle-track"><span></span></span><span class="account-toggle-label">${accountEnabled ? "启用" : "停用"}</span>
+            </button>
+          </td>
+          <td data-label="自动创建">
+            <button class="account-toggle ${autoCreateEnabled ? "is-on" : "is-off"}" type="button" data-action="toggle-account-auto-create" data-id="${escapeHTML(account.id)}" data-enabled="${autoCreateEnabled}" role="switch" aria-checked="${autoCreateEnabled}" title="${autoCreateEnabled ? "关闭该账号自动创建" : "开启该账号自动创建"}" aria-label="${autoCreateEnabled ? "关闭该账号自动创建" : "开启该账号自动创建"}">
+              <span class="account-toggle-track"><span></span></span><span class="account-toggle-label">${autoCreateEnabled ? "开启" : "关闭"}</span>
+            </button>
+          </td>
           <td data-label="最近验证"><span class="cell-secondary">${escapeHTML(formatDate(account.last_validated))}</span></td>
           <td data-label="操作" class="align-right">
             <div class="row-actions">
               <button class="icon-button" type="button" data-action="open-aliases" data-id="${escapeHTML(account.id)}" title="查看别名" aria-label="查看别名"><i data-lucide="at-sign"></i></button>
               <button class="icon-button" type="button" data-action="update-cookies" data-id="${escapeHTML(account.id)}" title="更新 Cookie" aria-label="更新 Cookie"><i data-lucide="cookie"></i></button>
-              <button class="icon-button" type="button" data-action="set-password" data-id="${escapeHTML(account.id)}" title="设置 App Password" aria-label="设置 App Password"><i data-lucide="key-round"></i></button>
+              <button class="icon-button" type="button" data-action="set-mail-receiver" data-id="${escapeHTML(account.id)}" title="配置转发收件箱" aria-label="配置转发收件箱"><i data-lucide="mail-cog"></i></button>
+              ${account.mail_receiver ? `<button class="icon-button is-danger" type="button" data-action="clear-mail-receiver" data-id="${escapeHTML(account.id)}" title="清除转发收件箱配置" aria-label="清除转发收件箱配置"><i data-lucide="mail-x"></i></button>` : ""}
               <button class="icon-button is-danger" type="button" data-action="delete-account" data-id="${escapeHTML(account.id)}" title="删除账号" aria-label="删除账号"><i data-lucide="trash-2"></i></button>
             </div>
           </td>
@@ -229,14 +249,14 @@
   function renderAccountsLoading() {
     $("#accounts-empty").hidden = true;
     $("#accounts-table-shell").hidden = false;
-    $("#accounts-body").innerHTML = `<tr><td colspan="6"><div class="loading-state"><i data-lucide="loader-circle"></i><span>加载中</span></div></td></tr>`;
+    $("#accounts-body").innerHTML = `<tr><td colspan="9"><div class="loading-state"><i data-lucide="loader-circle"></i><span>加载中</span></div></td></tr>`;
     renderIcons($("#accounts-body"));
   }
 
   async function refreshAccounts({ silent = false } = {}) {
     if (!silent) renderAccountsLoading();
     try {
-      state.accounts = (await request("/api/accounts")) || [];
+      state.accounts = (await request("/api/accounts?include_disabled=true")) || [];
       setServiceStatus(true);
       renderAccounts();
       renderMailboxList();
@@ -536,12 +556,21 @@
     });
   }
 
+  function aliasCallerTags(alias) {
+    const callers = alias.used_by || [];
+    if (!callers.length) return `<span class="cell-secondary">尚未领取</span>`;
+    return `<div class="alias-caller-list">${callers.map((caller) => `
+      <button class="alias-caller-tag" type="button" data-action="remove-alias-caller" data-id="${escapeHTML(alias.anonymousId)}" data-account-id="${escapeHTML(alias.account_id)}" data-email="${escapeHTML(alias.email)}" data-caller="${escapeHTML(caller)}" title="删除 ${escapeHTML(caller)} 的使用记录" aria-label="删除 ${escapeHTML(caller)} 的使用记录">
+        <span>${escapeHTML(caller)}</span><i data-lucide="x"></i>
+      </button>`).join("")}</div>`;
+  }
+
   function renderAliases() {
     const body = $("#aliases-body");
     const shell = $("#aliases-table-shell");
     const empty = $("#aliases-empty");
     const aliases = filteredAliases();
-    $("#create-alias-button").disabled = state.accounts.length === 0;
+    $("#create-alias-button").disabled = !state.accounts.some((account) => account.enabled !== false);
     const activeCount = state.aliases.filter((alias) => alias.active).length;
     $("#aliases-summary").textContent = `${state.accounts.length} 个账号 · ${activeCount} 个有效 / ${state.aliases.length} 个别名`;
 
@@ -559,7 +588,7 @@
         </td>
         <td data-label="所属账号"><span class="cell-secondary account-email">${escapeHTML(alias.account_email || alias.account_id)}</span></td>
         <td data-label="状态"><span class="status-badge ${alias.active ? "status-active" : "status-inactive"}">${alias.active ? "使用中" : "已停用"}</span></td>
-        <td data-label="调用方使用记录"><span class="cell-secondary">${escapeHTML((alias.used_by || []).join("、") || "尚未领取")}</span></td>
+        <td data-label="调用方使用记录">${aliasCallerTags(alias)}</td>
         <td data-label="创建时间"><span class="cell-secondary">${escapeHTML(formatDate(alias.createdAt))}</span></td>
         <td data-label="操作" class="align-right">
           <div class="row-actions">
@@ -612,7 +641,8 @@
 
   async function refreshAliasesFromServer() {
     renderAliasesLoading();
-    const results = await Promise.allSettled(state.accounts.map(async (account) => {
+    const enabledAccounts = state.accounts.filter((account) => account.enabled !== false);
+    const results = await Promise.allSettled(enabledAccounts.map(async (account) => {
       const data = await request(`/api/aliases?account_id=${encodeURIComponent(account.id)}`);
       return {
         account,
@@ -630,7 +660,7 @@
         aliases.push(...result.value.aliases);
         updateAccountAliasStats(result.value.account.id, result.value.aliases);
       } else {
-        failures.push(`${accountLabel(state.accounts[index])}: ${result.reason?.message || "同步失败"}`);
+        failures.push(`${accountLabel(enabledAccounts[index])}: ${result.reason?.message || "同步失败"}`);
       }
     });
     state.aliases = aliases.sort((left, right) => sortableDate(right.createdAt) - sortableDate(left.createdAt)
@@ -922,7 +952,7 @@
     }
     renderMailDetailLoading();
     const requestMailboxKey = state.selectedMailboxKey;
-    const params = new URLSearchParams({ account_id: mailbox.account_id, id: messageId });
+    const params = new URLSearchParams({ account_id: mailbox.account_id, alias: mailbox.email, id: messageId });
     try {
       const data = await request(`/api/inbox/message?${params}`);
       if (state.selectedMailboxKey !== requestMailboxKey || state.selectedMessageId !== messageId) return;
@@ -1093,34 +1123,100 @@
     });
   }
 
-  function openPasswordEditor(account) {
+  async function toggleAccountAutoCreate(button) {
+    const account = findAccount(button.dataset.id);
     if (!account) return;
+    const enabled = button.dataset.enabled === "true";
+    setButtonLoading(button, true);
+    try {
+      await request(`/api/accounts/${encodeURIComponent(account.id)}/auto-create`, {
+        method: "PUT",
+        body: JSON.stringify({ enabled: !enabled }),
+      });
+      await refreshAccounts({ silent: true });
+      toast(!enabled ? "该账号自动创建已开启" : "该账号自动创建已关闭");
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      setButtonLoading(button, false);
+    }
+  }
+
+  async function toggleAccountEnabled(button) {
+    const account = findAccount(button.dataset.id);
+    if (!account) return;
+    const enabled = button.dataset.enabled === "true";
+    setButtonLoading(button, true);
+    try {
+      await request(`/api/accounts/${encodeURIComponent(account.id)}/enabled`, {
+        method: "PUT",
+        body: JSON.stringify({ enabled: !enabled }),
+      });
+      await refreshAccounts({ silent: true });
+      if (enabled) {
+        state.aliases = state.aliases.filter((alias) => alias.account_id !== account.id);
+        state.aliasesLoadedFor = "";
+        renderAliases();
+        renderMailboxList();
+      }
+      toast(enabled ? "该账号已停用，全部功能已关闭" : "该账号已启用");
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      setButtonLoading(button, false);
+    }
+  }
+
+  function openMailReceiverEditor(account) {
+    if (!account) return;
+    const receiver = account.mail_receiver || {};
     openEditor({
       eyebrow: accountLabel(account),
-      title: "设置 App Password",
-      submitLabel: "验证并保存",
+      title: "配置转发收件箱",
+      submitLabel: "保存收件配置",
       body: `
-        <label class="field"><span>iCloud 邮箱</span><input name="icloud_email" type="email" value="${escapeHTML(account.icloud_email || "")}" required autocomplete="username"></label>
-        <label class="field"><span>App 专用密码</span><input name="app_password" type="password" required autocomplete="new-password" placeholder="xxxx-xxxx-xxxx-xxxx"></label>`,
+        <div class="field-row">
+          <label class="field"><span>转发收件箱地址</span><input name="address" type="email" value="${escapeHTML(receiver.address || "")}" required autocomplete="off"></label>
+          <label class="field"><span>邮箱 ID（可选）</span><input name="mailbox_id" value="${escapeHTML(receiver.mailbox_id || "")}" autocomplete="off"></label>
+        </div>
+        <label class="field"><span>MoeMail API 地址</span><input name="base_url" value="${escapeHTML(receiver.base_url || "")}" autocomplete="off" placeholder="默认 https://moemail.app；自建实例填实例地址"></label>
+        <label class="field"><span>MoeMail API Key</span><input name="api_key" type="password" required autocomplete="new-password" placeholder="保存后不可见"></label>`,
       onSubmit: async (form) => {
         const data = new FormData(form);
-        await request(`/api/accounts/${encodeURIComponent(account.id)}/password`, {
-          method: "POST",
+        await request(`/api/accounts/${encodeURIComponent(account.id)}/mail-receiver`, {
+          method: "PUT",
           body: JSON.stringify({
-            icloud_email: String(data.get("icloud_email") || "").trim(),
-            app_password: String(data.get("app_password") || "").trim(),
+            address: String(data.get("address") || "").trim(),
+            base_url: String(data.get("base_url") || "").trim(),
+            api_key: String(data.get("api_key") || "").trim(),
+            mailbox_id: String(data.get("mailbox_id") || "").trim(),
           }),
         });
         closeEditor();
         await refreshAccounts({ silent: true });
-        toast("App Password 已验证并保存");
+        toast("转发收件箱配置已保存");
+      },
+    });
+  }
+
+  function clearMailReceiver(account) {
+    if (!account?.mail_receiver) return;
+    openConfirm({
+      title: "清除转发收件箱配置",
+      message: `将删除 ${receiverSummary(account)} 的 API 凭据。别名和 Apple Cookie 不会删除。`,
+      submitLabel: "清除配置",
+      onSubmit: async () => {
+        await request(`/api/accounts/${encodeURIComponent(account.id)}/mail-receiver`, { method: "DELETE" });
+        await refreshAccounts({ silent: true });
+        toast("转发收件箱配置已清除");
       },
     });
   }
 
   function openCreateAlias() {
-    if (!state.accounts.length) return toast("请先添加账号", "error");
-    const accountOptions = state.accounts
+    const enabledAccounts = state.accounts.filter((account) => account.enabled !== false);
+    if (!enabledAccounts.length) return toast(state.accounts.length ? "没有启用中的 iCloud 账号" : "请先添加账号", "error");
+    const accountOptions = enabledAccounts
       .map((account) => `<option value="${escapeHTML(account.id)}">${escapeHTML(accountLabel(account))}</option>`)
       .join("");
     openEditor({
@@ -1265,6 +1361,28 @@
     });
   }
 
+  function removeAliasCaller(button) {
+    const accountId = button.dataset.accountId;
+    const anonymousId = button.dataset.id;
+    const caller = button.dataset.caller;
+    if (!accountId || !anonymousId || !caller) return;
+    openConfirm({
+      title: "删除调用方记录",
+      message: `删除 ${button.dataset.email || "该别名"} 的 ${caller} 使用记录？该调用方之后可以再次领取此别名。`,
+      submitLabel: "删除记录",
+      onSubmit: async () => {
+        await request(`/api/aliases/${encodeURIComponent(anonymousId)}/callers/${encodeURIComponent(caller)}`, {
+          method: "DELETE",
+          body: JSON.stringify({ account_id: accountId }),
+        });
+        const alias = state.aliases.find((item) => item.account_id === accountId && item.anonymousId === anonymousId);
+        if (alias) alias.used_by = (alias.used_by || []).filter((item) => item.toLowerCase() !== caller.toLowerCase());
+        renderAliases();
+        toast("调用方使用记录已删除");
+      },
+    });
+  }
+
   function deleteAccount(account) {
     if (!account) return;
     openConfirm({
@@ -1315,12 +1433,16 @@
       const account = findAccount(button.dataset.id);
       if (action === "add-account") openAddAccount();
       if (action === "update-cookies") openCookieEditor(account);
-      if (action === "set-password") openPasswordEditor(account);
+      if (action === "toggle-account-enabled") toggleAccountEnabled(button);
+      if (action === "toggle-account-auto-create") toggleAccountAutoCreate(button);
+      if (action === "set-mail-receiver") openMailReceiverEditor(account);
+      if (action === "clear-mail-receiver") clearMailReceiver(account);
       if (action === "delete-account") deleteAccount(account);
       if (action === "create-alias") openCreateAlias();
       if (action === "copy-email") copyText(button.dataset.email || "", "邮箱已复制");
       if (action === "toggle-alias") toggleAlias(button);
       if (action === "delete-alias") deleteAlias(button);
+      if (action === "remove-alias-caller") removeAliasCaller(button);
       if (action === "close-message") {
         state.selectedMessageId = "";
         renderMessages();

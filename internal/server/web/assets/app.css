@@ -895,6 +895,38 @@ th:last-child {
   color: var(--red);
 }
 
+.alias-caller-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.alias-caller-tag {
+  min-height: 24px;
+  padding: 2px 5px 2px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.alias-caller-tag:hover {
+  border-color: var(--red);
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.alias-caller-tag svg {
+  width: 13px;
+  height: 13px;
+}
+
 .row-actions {
   display: flex;
   justify-content: flex-end;
@@ -909,6 +941,61 @@ th:last-child {
 .row-actions .icon-button svg {
   width: 16px;
   height: 16px;
+}
+
+.account-toggle {
+  min-width: 72px;
+  min-height: 30px;
+  padding: 3px 8px 3px 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
+}
+
+.account-toggle:hover {
+  border-color: #9ba7a2;
+}
+
+.account-toggle.is-on {
+  border-color: #9bcfb9;
+  background: var(--teal-soft);
+  color: var(--green-strong);
+}
+
+.account-toggle-track {
+  width: 25px;
+  height: 16px;
+  padding: 2px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  background: #aeb9b4;
+  transition: background-color 150ms ease;
+}
+
+.account-toggle-track span {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(24, 33, 31, 0.22);
+  transition: transform 150ms ease;
+}
+
+.account-toggle.is-on .account-toggle-track {
+  background: var(--green);
+}
+
+.account-toggle.is-on .account-toggle-track span {
+  transform: translateX(9px);
 }
 
 .email-cell {

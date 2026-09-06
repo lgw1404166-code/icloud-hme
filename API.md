@@ -27,7 +27,7 @@ Content-Type: application/json
 - `401 Unauthorized` — API Key 无效，或 iCloud Cookie 会话失效（以响应消息区分）
 - `400 Bad Request` — 参数错误
 - `404 Not Found` — 账号不存在
-- `424 Failed Dependency` — Apple 创建接口、邮件 IMAP 或 iCloud Web 邮件依赖不可用
+- `424 Failed Dependency` — Apple 创建接口或账号配置的 MoeMail 收件 API 不可用
 - `429 Too Many Requests` — 同账号已有创建请求、仍在本地冷却期，或 Apple 返回限流
 
 创建接口的 `429` 和带冷却的 `424` 响应会包含 `Retry-After` 响应头（单位为秒）。
@@ -70,13 +70,14 @@ Content-Type: application/json
 - 兼容字段: `client`、`identity` 也会作为调用方身份读取
 
 账号 ID 通过 `GET /api/accounts` 获取。删除账号再重新添加会生成新的 ID，外部调用方应重新查询，不能继续使用已删除账号的 ID。
+该接口默认只返回已启用账号，因此停用账号不会再被业务调用方选中。管理界面需要查看并重新启用停用账号时，使用 `GET /api/accounts?include_disabled=true`。
 
 **错误情况:**
 - `400` — 缺少 `caller`
 - `401` — 同步别名列表时发现 Cookie 过期，需重新登录并更新 Cookie
 - `409` — 当前本地别名池中没有可分配给该调用方的新邮箱
 
-从此版本起，外部调用 `POST /api/create` 只做“领取/分配”，不会向 Apple 发起创建请求。后台别名池任务会按固定节奏预先创建邮箱：
+从此版本起，外部调用 `POST /api/create` 只做“领取/分配”，不会向 Apple 发起创建请求。领取成功即永久记录该 `caller` 的使用标签；如业务在注册前发生明确失败，可调用通用释放接口移除自己的标签。后台别名池任务会按固定节奏预先创建邮箱：
 
 - 默认每小时 10 个（约 6 分钟 1 个），通过 `ICLOUD_HME_AUTO_CREATE_PER_HOUR` 调整
 - `ICLOUD_HME_AUTO_CREATE=0|off|false` 可关闭后台创建
@@ -91,7 +92,7 @@ Content-Type: application/json
 GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&folder=all&limit=20&days=7
 ```
 
-**响应 (走 IMAP,App Password):**
+**响应 (MoeMail):**
 ```json
 {
   "success": true,
@@ -100,7 +101,7 @@ GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&folder=all&limit=20&days
     "alias": "xyz123@icloud.com",
     "folder": "all",
     "count": 2,
-    "method": "imap",
+    "method": "moemail_api",
     "messages": [
       {
         "id": "junk:1042",
@@ -115,52 +116,28 @@ GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&folder=all&limit=20&days
 }
 ```
 
-**响应 (回退到 Web API,Cookie):** `method` 变为 `web_api`
-```json
-{
-  "success": true,
-  "data": {
-    "account_id": "acc_1",
-    "alias": "xyz123@icloud.com",
-    "folder": "inbox",
-    "count": 1,
-    "method": "web_api",
-    "messages": [
-      {
-        "id": "AQMkAD...",
-        "from": "GitHub <noreply@github.com>",
-        "to": "xyz123@icloud.com",
-        "subject": "[GitHub] Please verify your email address",
-        "date": "Wed, 09 Jul 2026 06:32:10 GMT",
-        "preview": "Almost done! To finish setting up your account..",
-        "folder": "inbox"
-      }
-    ]
-  }
-}
-```
-
 **参数说明:**
 - `account_id` (必填) — 账号 ID
-- `alias` (可选) — 只返回发到该别名的邮件
-- `folder` (可选) — `all`、`inbox` 或 `junk`，默认 `all`;别名查询同样按此范围搜索
+- `alias` (必填) — 只返回能精确确认发到该别名的邮件
+- `folder` (可选) — `all` 或 `inbox`，默认 `all`；MoeMail API 不提供垃圾邮件目录
 - `limit` (可选) — 返回邮件数量，默认 20
-- `days` (可选) — 查找最近几天的邮件，默认 7 (仅 IMAP 模式)
+- `days` (可选) — 查找最近几天的邮件，默认 `0` 表示不限
 
-**邮件读取双路径 (自动选择):**
-1. **优先: IMAP (App Password)** — 设置了 App Password 时使用,支持服务端按收件人搜索
-2. **回退: Web API (Cookie 认证)** — 仅 `folder=inbox` 时可回退;`all` 和 `junk` 必须使用 IMAP
+**邮件读取方式:**
+1. 每个 Apple 账号配置一个固定的 MoeMail 转发收件箱。
+2. `GET /api/inbox` 和 `GET /api/inbox/message` 只使用该提供商的公开 API；iCloud IMAP、iCloud Web Mail 和 App Password 均不参与读取。
 
-响应中 `"method": "imap"` 或 `"method": "web_api"` 标识实际使用的读取方式。
+响应中的 `method` 为 `moemail_api`。
 
 **别名过滤逻辑:**
-- **IMAP (`FindByRecipientInFolder`):** 按所选邮件夹使用原生 IMAP `TO` 头搜索;`all` 会合并 `INBOX` 和 `Junk`，按时间倒序后应用 `limit`
-- **Web API (`FindByAlias`):** iCloud Web API 不支持按收件人搜索,拉取 `limit*2` (至少 50) 条后本地对 `Subject`/`From`/`To` 做包含匹配
+- **MoeMail:** 使用 `GET /api/emails` 定位固定收件箱，随后调用 `GET /api/emails/{mailboxId}` 与 `GET /api/emails/{mailboxId}/{messageId}`。
+- **精确过滤:** 仅匹配 `to`、`to_address`、`X-Original-To`、`Delivered-To` 等收件人字段或原始头中完整等于 `alias` 的邮箱地址；不会以主题或发件人进行猜测匹配。
+- **实例要求:** 固定转发场景下，MoeMail 必须保留 Apple 转发前的 HME 原始收件人并通过 `to_address` 或邮件头返回。官方 MoeMail Worker 默认只保存转发目标地址，无法准确区分多个 HME 别名；服务检测到该情况会返回 `424`，不会猜测归属。
 
 **返回字段差异 (两条路径):**
-- `id` — IMAP 是带邮件夹前缀的 UID (`inbox:1042` / `junk:1042`),Web API 是 iCloud GUID
-- `folder` — 邮件所在文件夹: `inbox` 或 `junk`
-- `date` — IMAP 走 RFC3339,Web API 是原始邮件头 RFC1123 串
+- `id` — MoeMail 提供商的邮件 ID，取正文时原样传回
+- `folder` — 固定为 `inbox`
+- `date` — 提供商时间戳转换为 RFC3339
 - `preview` — 正文摘要,非完整正文
 
 列表接口现在只拉取信封摘要（UID、发件人、收件人、主题、日期），正文按需读取，页面点击邮件后才加载完整内容。
@@ -168,7 +145,7 @@ GET /api/inbox?account_id=acc_1&alias=xyz123@icloud.com&folder=all&limit=20&days
 ### 2.1 读取单封邮件正文
 
 ```http
-GET /api/inbox/message?account_id=acc_1&id=junk:1042
+GET /api/inbox/message?account_id=acc_1&alias=xyz123@icloud.com&id=1042
 ```
 
 **响应:**
@@ -177,14 +154,14 @@ GET /api/inbox/message?account_id=acc_1&id=junk:1042
   "success": true,
   "data": {
     "account_id": "acc_1",
-    "method": "imap",
+    "method": "moemail_api",
     "message": {
-      "id": "junk:1042",
+      "id": "1042",
       "from": "GitHub <noreply@github.com>",
       "to": "xyz123@icloud.com",
       "subject": "Verify",
       "date": "2026-07-09T14:32:10+08:00",
-      "folder": "junk",
+      "folder": "inbox",
       "body": "纯文本正文",
       "html": "<html>...</html>",
       "content_type": "multipart/alternative; boundary=...",
@@ -196,9 +173,30 @@ GET /api/inbox/message?account_id=acc_1&id=junk:1042
 
 HTML 邮件会同时返回 `html` 与从 HTML 提取的 `body`；管理页面使用 sandbox iframe 展示 HTML 正文。
 
+### 2.2 配置账号转发收件箱
+
+```http
+PUT /api/accounts/:id/mail-receiver
+Content-Type: application/json
+
+{
+  "address": "relay@example.com",
+  "api_key": "your-moemail-api-key",
+  "base_url": "https://moemail.app"
+}
+```
+
+`base_url` 填 MoeMail 实例地址，`mailbox_id` 可选。接口响应和 `GET /api/accounts` 只返回地址、实例和邮箱 ID，不会返回 API Key。先在 Apple 隐私邮箱页面将“转发至”改为同一个固定邮箱。
+
+```http
+DELETE /api/accounts/:id/mail-receiver
+```
+
+清除该账号的转发收件箱凭据，不会删除 Apple Cookie、HME 别名或本地别名池记录。
+
 ---
 
-### 2.2 OTP webhook 与重新登录配置
+### 2.3 OTP webhook 与重新登录配置
 
 #### 接收 Android/SMSGate 验证码
 
@@ -308,10 +306,16 @@ Content-Type: application/json
 
 ## 账号管理接口
 
-### 3. 列出所有账号
+### 3. 列出可用账号
 
 ```http
 GET /api/accounts
+```
+
+默认只返回 `enabled=true` 的账号。需要进行账号管理时，可通过 `include_disabled=true` 查询包括停用账号在内的完整列表：
+
+```http
+GET /api/accounts?include_disabled=true
 ```
 
 **响应:**
@@ -322,13 +326,15 @@ GET /api/accounts
     {
       "id": "acc_1",
       "name": "主号",
-      "host": "imap.mail.me.com"
+      "host": "icloud.com",
+      "enabled": true,
+      "auto_create_enabled": true
     }
   ]
 }
 ```
 
-**注意:** 响应中不包含敏感信息（cookies、app_passwords）
+**注意:** 响应中不包含敏感信息（cookies、mail_receiver.api_key）
 
 ---
 
@@ -371,7 +377,7 @@ Content-Type: application/json
 
 要启用后台别名池创建，请同时导入 `icloud.com` 与 `account.apple.com` / `appleid.apple.com` Cookie，并保留 `myacinfo`、`caw`/`caw-at` 或 `awat` 等账户会话 Cookie。后台任务检测到账户会话后，会优先使用 Apple 账户管理接口创建新别名并写入本地池；外部 `POST /api/create` 只从池中领取，响应为 `protocol: "local_pool"`。
 
-Apple 账户管理会话不是永久令牌：当前 `/account/manage/gs/ws/token` 响应中的 `caw-at`、`awat` 为 `Max-Age=900` 的滚动 Cookie。服务会保存每次响应更新的 `scnt` 和 CookieJar Cookie；持续调用时可自动滚动，长时间空闲后仍需从已登录的 Apple 账户页重新导入会话 Cookie。App Password 不会延长该会话。
+Apple 账户管理会话不是永久令牌：当前 `/account/manage/gs/ws/token` 响应中的 `caw-at`、`awat` 为 `Max-Age=900` 的滚动 Cookie。服务会保存每次响应更新的 `scnt` 和 CookieJar Cookie；持续调用时可自动滚动，长时间空闲后仍需从已登录的 Apple 账户页重新导入会话 Cookie。
 
 服务默认通过后台任务每 10 分钟刷新一次账户管理会话。可设置 `ICLOUD_HME_ACCOUNT_REFRESH_INTERVAL=8m` 调整间隔，或设置为 `0` / `off` 关闭。别名池创建由 `ICLOUD_HME_AUTO_CREATE*` 系列环境变量控制。
 
@@ -379,7 +385,57 @@ Apple 账户管理会话不是永久令牌：当前 `/account/manage/gs/ws/token
 
 ---
 
-### 5. 删除账号
+### 5. 设置账号启用开关
+
+此开关控制账号是否参与别名领取、别名同步与管理、邮件读取以及后台自动创建。停用账号仍会保留在账号列表中，Cookie、转发收件箱配置和重新启用操作不受影响。
+
+```http
+PUT /api/accounts/:id/enabled
+Content-Type: application/json
+
+{
+  "enabled": false
+}
+```
+
+**响应:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "acc_1",
+    "enabled": false
+  }
+}
+```
+
+停用后，`POST /api/create` 不会再选择该账号；显式指定停用账号会返回 `409 Conflict`。
+
+### 6. 设置账号级自动创建开关
+
+此开关只控制后台别名池是否为指定账号向 Apple 创建新别名，不影响收件箱、已有别名或手动领取。
+
+```http
+PUT /api/accounts/:id/auto-create
+Content-Type: application/json
+
+{
+  "enabled": false
+}
+```
+
+**响应:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "acc_1",
+    "enabled": false
+  }
+}
+```
+
+### 7. 删除账号
 
 ```http
 DELETE /api/accounts/:id
@@ -401,40 +457,9 @@ DELETE /api/accounts/:id
 
 ---
 
-### 6. 设置 App Password
-
-```http
-POST /api/accounts/:id/password
-Content-Type: application/json
-
-{
-  "icloud_email": "your_email@icloud.com",
-  "app_password": "xxxx-xxxx-xxxx-xxxx"
-}
-```
-
-**响应:**
-```json
-{
-  "success": true,
-  "data": {
-    "id": "acc_1",
-    "icloud_email": "your_email@icloud.com"
-  }
-}
-```
-
-**参数说明:**
-- `icloud_email` (必填) — iCloud 邮箱地址
-- `app_password` (必填) — App 专用密码
-
-**用途:** App Password 用于 IMAP 邮件读取，生成方式见 [appleid.apple.com](https://appleid.apple.com)
-
----
-
 ## 别名管理接口
 
-### 7. 列出所有别名
+### 9. 列出所有别名
 
 ```http
 GET /api/aliases?account_id=acc_1
@@ -478,7 +503,61 @@ GET /api/aliases?account_id=acc_1
 
 ---
 
-### 8. 停用别名
+### 9.1 释放调用方领取记录
+
+业务调用方在确认自己的注册流程尚未完成时，可释放已领取的别名，让该 `caller` 后续能够再次领取它。释放不会停用或删除 Apple 侧别名，也不会影响其他调用方的标签。
+
+```http
+POST /api/aliases/release
+Content-Type: application/json
+
+{
+  "account_id": "acc_1",
+  "anonymous_id": "abc123",
+  "caller": "lovart"
+}
+```
+
+**参数说明:**
+- `account_id`（必填）— 别名所属账号 ID
+- `anonymous_id`（必填）— `POST /api/create` 返回的 `anonymousId`
+- `caller`（必填）— 要释放的调用方身份，大小写不敏感
+
+下列旧接口保留以兼容已有客户端：
+
+```http
+DELETE /api/aliases/:id/callers/:caller
+Content-Type: application/json
+
+{
+  "account_id": "acc_1"
+}
+```
+
+**响应:**
+```json
+{
+  "success": true,
+  "data": {
+    "account_id": "acc_1",
+    "anonymousId": "abc123",
+    "email": "xyz123@icloud.com",
+    "caller": "moxt",
+    "used_by": ["chatgpt"]
+  }
+}
+```
+
+**参数说明:**
+- `:id` (路径参数) — 别名的 `anonymousId`
+- `:caller` (路径参数) — 要删除的调用方标识，大小写不敏感
+- `account_id` (必填) — 别名所属账号 ID
+
+该操作只删除本地保存的调用方领取记录，不会停用或删除 Apple 侧别名。记录删除后，该调用方可以再次领取这个别名。
+
+---
+
+### 10. 停用别名
 
 ```http
 POST /api/aliases/:id/deactivate
@@ -508,7 +587,7 @@ Content-Type: application/json
 
 ---
 
-### 9. 激活别名
+### 11. 激活别名
 
 ```http
 POST /api/aliases/:id/reactivate
@@ -538,7 +617,7 @@ Content-Type: application/json
 
 ---
 
-### 10. 删除别名
+### 12. 删除别名
 
 ```http
 DELETE /api/aliases/:id
@@ -656,7 +735,7 @@ for alias in resp.json()["data"]["aliases"]:
 
 ### Cookie 认证 (推荐,功能最完整)
 
-用于：后台定时创建别名、列出别名、停用/激活/删除别名、**读取邮件回退**
+用于：后台定时创建别名、列出别名、停用/激活/删除别名
 
 **获取方式:**
 1. 浏览器登录 [icloud.com](https://www.icloud.com) 或 [https://www.icloud.com.cn](https://www.icloud.com.cn) (国区)，并登录 `https://account.apple.com/account/manage/section/privacy`
@@ -671,36 +750,13 @@ for alias in resp.json()["data"]["aliases"]:
 
 账户页短 Cookie 会滚动刷新；服务默认每 10 分钟保活。根会话失效时，管理页面会提示重新登录并打开 Apple 隐私邮箱页面，登录后更新 Cookie 即可继续后台创建。
 
-### App Password 认证 (IMAP 回退)
-
-仅用于 Web API 失败时的邮件读取回退
-
-**获取方式:**
-1. 登录 [appleid.apple.com](https://appleid.apple.com)
-2. 登录和安全 → App 专用密码
-3. 生成新密码
-
----
-
 ## 技术说明
 
 ### 邮件读取实现
 
-**Web API 路径** (`internal/mail/web_client.go`):
-1. 调用 `setup.icloud.com.cn/setup/ws/1/validate` 获取 `mccgateway` URL
-2. 调用 `mccgateway/mailws2/v1/thread/search` 读取邮件
-
-**⚠️ 已知坑:**
-- `validate` 返回的 mccgateway URL 可能带 `:443` 端口 (如 `p217-mccgateway.icloud.com.cn:443`)
-- tls-client 的 cookie jar 按不带端口的 host 存储 cookie
-- 带端口请求时 cookie 无法附加,导致 403
-- **解决:** 解析 URL 后剥离端口号
-
-**clientBuildNumber:** 与浏览器一致,当前 `2624Build22`
-
-**IMAP 路径** (`internal/mail/client.go`):
-- 标准 IMAP 协议,连接 `imap.mail.me.com:993`
-- 需要 App Password
+- `internal/server/receiver_api.go` 实现 MoeMail 收件 API。
+- MoeMail 基址默认 `https://moemail.app`，使用实例的 `X-API-Key`。
+- 账号级凭据持久化在 `accounts.json`，所有账号查询与配置响应均做脱敏。
 
 ---
 
@@ -757,4 +813,4 @@ Apple 返回非限流错误或连接异常时，本服务使用 `424 Failed Depe
 
 - **创建频率**: 同账号最短间隔 30 秒；上游失败后默认冷却 10 分钟
 - **Cookie 有效期**: 约 24 小时，需定期更新
-- **邮件读取**: 依赖 IMAP 连接，超时默认 30 秒
+- **邮件读取**: 依赖账号配置的 MoeMail HTTPS API，超时默认 30 秒

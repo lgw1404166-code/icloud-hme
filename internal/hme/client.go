@@ -62,14 +62,15 @@ type AccountInfo struct {
 
 // Alias 是一个 Hide My Email 隐私邮箱别名。
 type Alias struct {
-	Email       string   `json:"email"`
-	AnonymousID string   `json:"anonymousId"`
-	Label       string   `json:"label"`
-	Active      bool     `json:"active"`
-	CreatedAt   string   `json:"createdAt,omitempty"`
-	UsedBy      []string `json:"used_by,omitempty"`
-	UsedByCount int      `json:"used_by_count,omitempty"`
-	LastUsedAt  string   `json:"last_used_at,omitempty"`
+	Email          string   `json:"email"`
+	AnonymousID    string   `json:"anonymousId"`
+	Label          string   `json:"label"`
+	Active         bool     `json:"active"`
+	CreatedAt      string   `json:"createdAt,omitempty"`
+	UsedBy         []string `json:"used_by,omitempty"`
+	UsedByCount    int      `json:"used_by_count,omitempty"`
+	LastUsedAt     string   `json:"last_used_at,omitempty"`
+	PendingCallers []string `json:"pending_callers,omitempty"`
 }
 
 // HTTPError 描述 iCloud 返回的非 2xx 响应。
