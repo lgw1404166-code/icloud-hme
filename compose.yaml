@@ -32,6 +32,13 @@ services:
       ICLOUD_HME_ENV_FILE: /app/config/.env
     ports:
       - "127.0.0.1:18081:8081"
+    networks:
+      - default
+      - shared_network
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 9.9.9.9
     volumes:
       - ./data:/app/data
       - ./.env:/app/config/.env
@@ -54,3 +61,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  shared_network:
+    external: true
+    name: shared-network
