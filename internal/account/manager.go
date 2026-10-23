@@ -383,6 +383,47 @@ func (m *Manager) ListAccounts() []*Account {
 	return out
 }
 
+// LocalAlias contains only public fields, never account credentials.
+type LocalAlias struct {
+	hme.Alias
+	AccountID    string `json:"account_id"`
+	AccountEmail string `json:"account_email"`
+}
+
+// ListLocalAliases reads persisted mailboxes without contacting Apple.
+// Keep inactive aliases available for reading their previously received mail.
+func (m *Manager) ListLocalAliases() []LocalAlias {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]LocalAlias, 0)
+	for _, acc := range m.accounts {
+		if !acc.Enabled {
+			continue
+		}
+		for _, usage := range acc.AliasUsages {
+			if usage == nil || strings.TrimSpace(usage.Email) == "" {
+				continue
+			}
+			out = append(out, LocalAlias{
+				Alias: hme.Alias{
+					Email: usage.Email, AnonymousID: usage.AnonymousID,
+					Label: usage.Label, Active: usage.Active, CreatedAt: usage.CreatedAt,
+					UsedBy: sortedUsageCallers(usage.UsedBy), UsedByCount: len(usage.UsedBy),
+					LastUsedAt: latestUsageAt(usage.UsedBy), PendingCallers: sortedPendingCallers(usage.PendingCallers),
+				},
+				AccountID: acc.ID, AccountEmail: firstNonEmpty(acc.RealEmail, acc.Name, acc.ID),
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AccountID != out[j].AccountID {
+			return out[i].AccountID < out[j].AccountID
+		}
+		return out[i].Email < out[j].Email
+	})
+	return out
+}
+
 // HMEClient 为指定账号创建一个新的 HME 客户端。
 // 必须有有效的 Cookie 才能使用 HME 功能。
 func (m *Manager) HMEClient(id string, verbose bool) (*hme.Client, error) {

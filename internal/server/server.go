@@ -124,6 +124,7 @@ func (s *Server) register() {
 
 		// ===== 别名管理 =====
 		api.GET("/aliases", s.listAliases)
+		api.GET("/aliases/local", s.listLocalAliases)
 		api.POST("/aliases/:id/deactivate", s.deactivateAlias)
 		api.POST("/aliases/:id/reactivate", s.reactivateAlias)
 		api.POST("/aliases/:id/callers", s.markAliasCaller)
@@ -787,6 +788,13 @@ func (s *Server) setAccountAutoCreate(c *gin.Context) {
 		return
 	}
 	ok(c, gin.H{"id": id, "enabled": *req.Enabled})
+}
+
+// listLocalAliases supplies the initial mailbox list without a remote refresh.
+func (s *Server) listLocalAliases(c *gin.Context) {
+	aliases := s.mgr.ListLocalAliases()
+	c.Header("Cache-Control", "no-store")
+	ok(c, gin.H{"aliases": aliases, "count": len(aliases), "source": "local"})
 }
 
 func (s *Server) listAliases(c *gin.Context) {

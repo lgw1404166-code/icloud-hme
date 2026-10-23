@@ -830,3 +830,13 @@ Apple 返回非限流错误或连接异常时，本服务使用 `424 Failed Depe
 - **创建频率**: 同账号最短间隔 30 秒；上游失败后默认冷却 10 分钟
 - **Cookie 有效期**: 约 24 小时，需定期更新
 - **邮件读取**: 依赖账号配置的 MoeMail HTTPS API，超时默认 30 秒
+
+
+### 本地邮箱列表（无需请求 Apple）
+
+GET /api/aliases/local
+
+按现有 API 鉴权访问。返回 success=true，data 包含 source=local、count、aliases。
+每条别名包含 email、anonymousId、label、active、createdAt、used_by、account_id 和 account_email；不返回 Cookie 或收件箱 API Key。
+仅显示启用账号的已保存别名，包含停用别名以便查询历史来信。空列表返回 []。
+页面初次打开和每分钟本地刷新使用此接口；GET /api/aliases?account_id=... 仍执行显式 Apple 同步。

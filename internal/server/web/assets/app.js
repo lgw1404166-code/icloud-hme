@@ -26,6 +26,7 @@
     aliasFilter: "all",
     aliasSearch: "",
     aliasesLoadedFor: "",
+    aliasesSyncing: false,
     modalSubmit: null,
     confirmSubmit: null,
     loginPrompted: {},
@@ -566,13 +567,14 @@
   }
 
   function renderAliases() {
+    if (state.view !== "aliases") return;
     const body = $("#aliases-body");
     const shell = $("#aliases-table-shell");
     const empty = $("#aliases-empty");
     const aliases = filteredAliases();
     $("#create-alias-button").disabled = !state.accounts.some((account) => account.enabled !== false);
     const activeCount = state.aliases.filter((alias) => alias.active).length;
-    $("#aliases-summary").textContent = `${state.accounts.length} 个账号 · ${activeCount} 个有效 / ${state.aliases.length} 个别名`;
+    $("#aliases-summary").textContent = `${state.accounts.length} 个账号 · ${activeCount} 个有效 / ${state.aliases.length} 个别名${state.aliasesSyncing ? " · 正在同步 Apple，现有邮箱仍可查信" : " · 已保存列表"}`;
 
     shell.hidden = aliases.length === 0;
     empty.hidden = aliases.length > 0;
@@ -600,30 +602,28 @@
     renderIcons(body);
   }
 
-  function renderAliasesLoading() {
-    $("#aliases-empty").hidden = true;
-    $("#aliases-table-shell").hidden = false;
-    $("#aliases-body").innerHTML = `<tr><td colspan="6"><div class="loading-state"><i data-lucide="loader-circle"></i><span>同步所有账号的 iCloud 别名</span></div></td></tr>`;
-    renderIcons($("#aliases-body"));
-  }
-
   function updateAccountAliasStats(accountId, aliases) {
     const account = findAccount(accountId);
     if (!account) return;
     account.alias_total = aliases.length;
     account.alias_active = aliases.filter((alias) => alias.active).length;
-    renderAccountMetrics();
-    renderAccounts();
+  }
+
+  function applyAliasList(aliases) {
+    state.aliases = aliases.sort((left, right) => sortableDate(right.createdAt) - sortableDate(left.createdAt)
+      || (left.account_email || "").localeCompare(right.account_email || "")
+      || (left.email || "").localeCompare(right.email || ""));
+    state.aliasesLoadedFor = "all";
+    renderAliases();
+    renderMailboxList();
+  }
+
+  async function loadSavedAliases() {
+    const data = await request("/api/aliases/local");
+    applyAliasList(data?.aliases || []);
   }
 
   async function refreshAliases({ force = false } = {}) {
-    if (!state.accounts.length) {
-      state.aliases = [];
-      state.aliasesLoadedFor = "";
-      renderAliases();
-      renderMailboxList();
-      return;
-    }
     if (!force && state.aliasesLoadedFor === "all") {
       renderAliases();
       renderMailboxList();
@@ -631,7 +631,7 @@
     }
 
     if (aliasesRequest) return aliasesRequest;
-    aliasesRequest = refreshAliasesFromServer();
+    aliasesRequest = force ? refreshAliasesFromServer() : loadSavedAliases();
     try {
       await aliasesRequest;
     } finally {
@@ -640,40 +640,41 @@
   }
 
   async function refreshAliasesFromServer() {
-    renderAliasesLoading();
-    const enabledAccounts = state.accounts.filter((account) => account.enabled !== false);
-    const results = await Promise.allSettled(enabledAccounts.map(async (account) => {
-      const data = await request(`/api/aliases?account_id=${encodeURIComponent(account.id)}`);
-      return {
-        account,
-        aliases: (data?.aliases || []).map((alias) => ({
-          ...alias,
-          account_id: account.id,
-          account_email: accountLabel(account),
-        })),
-      };
-    }));
-    const failures = [];
-    const aliases = [];
-    results.forEach((result, index) => {
-      if (result.status === "fulfilled") {
-        aliases.push(...result.value.aliases);
-        updateAccountAliasStats(result.value.account.id, result.value.aliases);
-      } else {
-        failures.push(`${accountLabel(enabledAccounts[index])}: ${result.reason?.message || "同步失败"}`);
-      }
-    });
-    state.aliases = aliases.sort((left, right) => sortableDate(right.createdAt) - sortableDate(left.createdAt)
-      || (left.account_email || "").localeCompare(right.account_email || "")
-      || (left.email || "").localeCompare(right.email || ""));
-    state.aliasesLoadedFor = "all";
+    if (state.aliasesLoadedFor !== "all") await loadSavedAliases();
+    state.aliasesSyncing = true;
     renderAliases();
-    renderMailboxList();
-    if (failures.length) {
-      toast(`${failures.length} 个账号同步失败：${failures.join("；")}`, "error");
-      if (results.some((result) => result.status === "rejected" && result.reason?.status === 401)) {
-        await refreshAccounts({ silent: true });
+    try {
+      const enabledAccounts = state.accounts.filter((account) => account.enabled !== false);
+      const results = await Promise.allSettled(enabledAccounts.map(async (account) => {
+        const data = await request(`/api/aliases?account_id=${encodeURIComponent(account.id)}`);
+        return {
+          account,
+          aliases: (data?.aliases || []).map((alias) => ({
+            ...alias,
+            account_id: account.id,
+            account_email: accountLabel(account),
+          })),
+        };
+      }));
+      const failures = [];
+      const aliases = [];
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") {
+          aliases.push(...result.value.aliases);
+          updateAccountAliasStats(result.value.account.id, result.value.aliases);
+        } else {
+          aliases.push(...state.aliases.filter((alias) => alias.account_id === enabledAccounts[index].id));
+          failures.push(`${accountLabel(enabledAccounts[index])}: ${result.reason?.message || "同步失败"}`);
+        }
+      });
+      applyAliasList(aliases);
+      renderAccounts();
+      if (failures.length) {
+        toast(`${failures.length} 个账号同步失败，保留已保存邮箱：${failures.join("；")}`, "error");
       }
+    } finally {
+      state.aliasesSyncing = false;
+      renderAliases();
     }
   }
 
@@ -691,6 +692,7 @@
   }
 
   function renderMailboxList() {
+    if (state.view !== "inbox") return;
     const list = $("#mailbox-list");
     if (!list) return;
     const mailboxes = filteredMailboxes();
@@ -989,6 +991,9 @@
     if (!viewMeta[view]) return;
     state.view = view;
     $("#page-title").textContent = viewMeta[view].title;
+    const refreshLabel = view === "aliases" ? "从 Apple 同步别名（保留现有邮箱列表）" : "刷新当前页面";
+    $("#refresh-view").title = refreshLabel;
+    $("#refresh-view").setAttribute("aria-label", refreshLabel);
     $$("[data-view-target]").forEach((button) => {
       const active = button.dataset.viewTarget === view;
       button.classList.toggle("is-active", active);
@@ -1585,10 +1590,15 @@
     bindEvents();
     renderMessages();
     try {
-      await refreshSettings();
+      void refreshSettings().catch((error) => toast(error.message, "error"));
       await refreshAccounts();
-      void refreshAliases({ force: true });
-      window.setInterval(() => refreshAccounts({ silent: true }).catch(() => {}), 60_000);
+      await refreshAliases();
+      window.setInterval(async () => {
+        try {
+          await refreshAccounts({ silent: true });
+          if (!aliasesRequest) await loadSavedAliases();
+        } catch { /* Keep the last usable mailbox list on a transient failure. */ }
+      }, 60_000);
     } catch {
       // The offline state and toast are handled by refreshAccounts.
     }
